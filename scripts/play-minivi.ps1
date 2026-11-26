@@ -31,11 +31,13 @@ $maxDim = switch ($Preset) {
     'quality-720p'  { '2048' }
     'native-1080p'  { '2048' }
 }
+$bakeMb = if ($Preset -eq 'perf-540p') { '128' } else { '256' }
 
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT   = '1'
     VICTORY_RELAY             = '1'
     VICTORY_RELAY_FLUSH_TABLES = '1'
+    VICTORY_SKIP_WC_BACK      = '1'
     VICTORY_CARD_STEPS        = '2'
     VICTORY_WIDE_BACK         = '1'
     VICTORY_CARD_REHASH_RUNS  = '1'
@@ -67,11 +69,17 @@ $settings = @{
     VICTORY_LEVELS_MAX_DIM    = $maxDim
     VICTORY_LEVELS_RECLAIM    = '1'
     VICTORY_RESIDENCY         = '1'
+    VICTORY_BAKE_SOURCES_MB   = $bakeMb
     VICTORY_PIPELINE_WAIT_MS  = '150'
     VICTORY_PIPELINE_WORKERS  = '6'
     VICTORY_PIPELINE_LOWEST   = '1'
     VICTORY_D3D12_DRED        = 'light'
     VICTORY_SKIP_PIPELINES    = 'none'
+}
+
+if ($Preset -eq 'quality-720p' -or $Preset -eq 'native-1080p') {
+    $settings.VICTORY_AMBIENT_SHADE   = '1.1,0.6'
+    $settings.VICTORY_AMBIENT_REFLECT = '0.65'
 }
 
 $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'

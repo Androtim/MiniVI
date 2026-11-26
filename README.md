@@ -17,6 +17,11 @@ Most recent compatibility forks target 12–24 GB VRAM GPUs and 64 GB RAM workst
 - **32 GB Host-RAM Residency Guard (`VICTORY_RESIDENCY=1`):** ports the host-memory pressure monitor and staging/prefetch admission guard from `codec-d/cool_fox` / `VIctory-7900XTX`.
 - **Landed-Flight Descriptor Table Flush (`VICTORY_RELAY_FLUSH_TABLES=1`):** frees dynamic descriptor table slots immediately when GPU flights land instead of holding them behind `bury_lag` (prevents dynamic heap exhaustion on NVIDIA 1M view heaps).
 - **NVIDIA & Visual Quality Base:** builds on `VIctory-NVIDIA` (Series S two-plane UI compose, `VICTORY_DYNAMIC_SLOTS=524288`, `VICTORY_BVH_MISS=1`, `VICTORY_OWN_UPSCALER=1`, `VICTORY_RENDER_SCALE`, `VICTORY_NAN_SCRUB=1`, and RT resolve skip list).
+- **Wave 1 Visual & FPS Fixes (`fxceless` upstream ports):**
+  - **Min-LOD Preservation (`#1210`):** keeps `ResourceMinLODClamp` intact when shifting `MostDetailedMip` on streamed texture views so partially resident textures stay sharp.
+  - **Early Depth Stencil (`#907`):** emits `ForceEarlyDepthStencil` on depth-before-shader pixel programs, fixing translucent hair/glass depth artefacts.
+  - **WC Readback Skip (`VICTORY_SKIP_WC_BACK=1`, `#868`):** skips unnecessary readback copies on CPU write-combining memory (~97% of WC copy traffic). *(Experimental `VICTORY_SKIP_WC_COMPARE=1` is off by default due to an upstream RTX 5080 device-loss report.)*
+  - **Bake Source Pre-Upload (`VICTORY_BAKE_SOURCES=1`, `#1264`):** uploads character/decoration bake source textures right before bake draws (`VICTORY_BAKE_SOURCES_MB=256` recommended on 8 GB cards).
 
 ---
 
@@ -51,6 +56,7 @@ $env:VICTORY_NAN_SCRUB = '1'
 Double-clickable wrappers are also in `scripts/`:
 - `scripts\play-minivi-540p.cmd` (`VICTORY_RENDER_SCALE=0.5`, lowest GPU/VRAM load)
 - `scripts\play-minivi-720p.cmd` (`VICTORY_RENDER_SCALE=0.6666667`, balanced 8 GB)
+- `scripts\play-minivi-720p-quality.cmd` (`VICTORY_RENDER_SCALE=0.6666667`, 2048 px mip cap + indoor ambient shading/reflect + WC skip)
 - `scripts\play-minivi-1080p.cmd` (`VICTORY_RENDER_SCALE=1.0`, native 1080p)
 
 ---
@@ -64,6 +70,11 @@ Double-clickable wrappers are also in `scripts/`:
 | `VICTORY_LEVELS_RECLAIM=1` | off | Unmaps standard mips no longer held and returns tiles to the pool safely after GPU fences complete. |
 | `VICTORY_RESIDENCY=1` | off | Enables host RAM / commit pressure throttling for staging buffers and texture prefetch on <=32 GB systems. |
 | `VICTORY_RELAY_FLUSH_TABLES=1` | off | Immediately releases descriptor table slots from landed GPU flights instead of waiting behind `VICTORY_BURY_LAG`. |
+| `VICTORY_SKIP_WC_BACK=1` | off (on in presets) | Safe FPS boost: skips reading back GPU-written data mapped onto write-combining guest memory. |
+| `VICTORY_SKIP_WC_COMPARE=1` | off (unsafe) | **Experimental / Unsafe:** skips WC card-before compare passes; upstream reported `DXGI_ERROR_DEVICE_REMOVED` on RTX 5080. |
+| `VICTORY_CENSUS=1` | off | Logs buffer-copy census counters every `VICTORY_CENSUS_SECONDS` seconds (`diag`/logging). |
+| `VICTORY_BAKE_SOURCES` / `_MB` | `1` / `1024` | Pre-uploads decoration bake source textures before bake draws (`VICTORY_BAKE_SOURCES_MB=256` recommended for 8 GB presets). |
+| `VICTORY_AMBIENT_SHADE` / `_REFLECT` | off | Indoor ambient shading (`1.1,0.6`) and reflection balance (`0.65`), enabled in `quality-720p`. |
 
 ---
 
