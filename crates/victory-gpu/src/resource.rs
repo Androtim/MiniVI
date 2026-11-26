@@ -1703,40 +1703,45 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept(Some(budget))
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
 }
 
+/// Pure calculation of reserved render-target headroom for [`targets_room_kept`].
+/// Defaults to 3,072 MiB on >=12 GiB cards, scaled to at most `budget / 4`
+/// on cards with `<= 9 GiB` VRAM unless `VICTORY_CARD_ROOM_FOR_TARGETS_MB` is set.
+#[cfg(any(windows, test))]
+fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Option<u64>) -> u64 {
+    const DEFAULT_MOST: u64 = 3072 << 20;
+    const SMALL_BUDGET_CEILING: u64 = 9 << 30;
+    if let Some(mb) = override_mb {
+        return mb.min(8192) << 20;
+    }
+    match vram_budget {
+        Some(budget) if budget <= SMALL_BUDGET_CEILING => DEFAULT_MOST.min(budget / 4),
+        _ => DEFAULT_MOST,
+    }
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
-///
-/// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
-/// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
-/// on, none of them idle (run 198's census). They are made with no room
-/// test, in the same frame as the card copies of title buffers (762 MB),
-/// after the texture queue has filled the card to its line with textures
-/// written while the world loaded (7.3 GB of them at the first world frame
-/// of run 193, of which 2.3 GB were let go again within 13 seconds). The
-/// card then stood at 99 to 100.5 % of its budget, buffer copies were
-/// turned down for good (31 of 95 made: the frame 355 ms where 95 give
-/// 238), and the queue was refused from the first world frame on. With
-/// their room kept, the queue stops that much earlier while the world
-/// loads and gets it back as the targets are made.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072, or capped at
+/// `budget / 4` on `<= 9 GiB` cards; 0: none) less what such copies hold now.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
+    let most = targets_room_kept_bytes(vram_budget, override_mb);
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
@@ -2045,7 +2050,7 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept(Some(budget));
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -4540,6 +4545,22 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn targets_room_kept_scales_on_8gb_cards() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(targets_room_kept_bytes(None, None), 3072 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(6 * GIB), None), 1536 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(8 * GIB), None), 2048 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(12 * GIB), None), 3072 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(16 * GIB), None), 3072 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(24 * GIB), None), 3072 * MIB);
+        // Explicit override always wins (clamped at 8192 MiB).
+        assert_eq!(targets_room_kept_bytes(Some(8 * GIB), Some(1024)), 1024 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(8 * GIB), Some(0)), 0);
+        assert_eq!(targets_room_kept_bytes(Some(24 * GIB), Some(10_000)), 8192 * MIB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that
