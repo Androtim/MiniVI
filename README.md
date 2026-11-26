@@ -43,14 +43,24 @@ cargo build --locked --release -p victory
 ```
 
 ### Run (Portable Scripts)
+> [!TIP]
+> **Pre-warming shaders offline is strongly recommended on lower-end / mid-range CPUs and 8 GB GPUs.** Live shader translation competes with cutscene streaming and frame recording, causing CPU bottlenecks, hitching, and delayed scene/model loads. Pre-warming once per build keeps CPU cores free during gameplay.
+
 Copy `victory.example.toml` to `victory.toml` and point `game_dir`, `cache_dir`, and `data_dir` at folders **outside** this repository (all paths stay untracked):
 ```powershell
-# Pre-warm shaders once (NVIDIA example):
+# 1a. Pre-warm Standard shaders once (for bench / quality / 540p / 720p / 1080p presets):
+Remove-Item Env:VICTORY_FIRSTLANE_OWN -ErrorAction SilentlyContinue
 $env:VICTORY_BVH_MISS = '1'
 $env:VICTORY_NAN_SCRUB = '1'
 .\target\diag\victory.exe shaders D:\Path\To\YourDump
 
-# Launch Series S (720p internal -> 1080p own upscaler, 8 GB preset):
+# 1b. Or pre-warm Real RT shaders (used by play-minivi.ps1 -RayTracing):
+Remove-Item Env:VICTORY_BVH_MISS -ErrorAction SilentlyContinue
+$env:VICTORY_FIRSTLANE_OWN = '1'
+$env:VICTORY_NAN_SCRUB = '1'
+.\target\diag\victory.exe shaders D:\Path\To\YourDump
+
+# 2. Launch Series S (720p internal -> 1080p own upscaler, 8 GB preset):
 .\scripts\play-minivi.ps1 -Exe D:\Path\To\YourDump\game_scarlett_master.exe -Preset balanced-720p
 ```
 Double-clickable wrappers are also in `scripts/`:
@@ -112,7 +122,7 @@ Double-clickable wrappers are also in `scripts/`:
 ### Open Caveats / Blockers
 - **Dark interiors & night shadows:** RT GI resolve passes are skipped via `scripts/rt_off_hashes.txt` by default, leaving low-light scenes dim under ambient stand-in values; real RT is testable via `play-minivi.ps1 -RayTracing`.
 - **Cutscene/character streaming hitches & colored-pixel / dark-face artifacts:** Under CPU DirectStorage streaming, fast camera cuts briefly show low-LOD polygons while meshes/textures stream in, and occasional character face shading/mip artifacts remain under investigation.
-- **Startup warm-up:** Re-warming the shader cache after shader translator updates is recommended so newly visited passes do not compile live.
+- **Startup warm-up:** Pre-warming shaders offline (`victory.exe shaders <GameDir>`) is especially beneficial for lower-end setups and is recommended after translator or flag changes so newly visited passes do not compile live mid-cutscene.
 - **NVIDIA-only testing so far:** Tested only on RTX 4060 Ti 8 GB; AMD and Intel GPUs remain untested.
 
 ---
