@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%USERPROFILE%\Downloads\GTA\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
+if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%USERPROFILE%\Downloads\GTA\GTA6.Xbox.v1.0.2.1"
 set "runner=%~dp0target\release\victory.exe"
 if not exist "%runner%" set "runner=%~dp0victory-3d-rtx-pareto-residency.exe"
 
