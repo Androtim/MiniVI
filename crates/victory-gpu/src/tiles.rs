@@ -335,6 +335,18 @@ struct Given {
     packed: Option<(usize, Vec<(u32, u32)>)>,
 }
 
+#[cfg(test)]
+impl Given {
+    fn runs(&self) -> Vec<(usize, u32, u32)> {
+        self.levels
+            .iter()
+            .chain(std::iter::once(&self.packed))
+            .flatten()
+            .flat_map(|(index, runs)| runs.iter().map(move |&(start, count)| (*index, start, count)))
+            .collect()
+    }
+}
+
 /// A host texture made without memory, and the tiles its levels have been
 /// given.
 pub(crate) struct Tiled {
