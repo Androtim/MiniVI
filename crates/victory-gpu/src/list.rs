@@ -238,25 +238,24 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
-/// Maximum idle host command lists kept for reuse, scaled down on <=32 GiB
-/// hosts (`128` vs `512`) or overridden via `VICTORY_LIST_POOL_MOST` (`16..=1024`).
+/// Maximum idle host command lists kept for reuse, defaulting to `512` or
+/// overridden via `VICTORY_LIST_POOL_MOST` (`16..=1024`). Under host RAM
+/// pressure, [`trim_idle_lists`] prunes excess entries down to 64.
 #[cfg(windows)]
-fn idle_list_most_for(limited_ram: bool, override_count: Option<usize>) -> usize {
+fn idle_list_most_for(_limited_ram: bool, override_count: Option<usize>) -> usize {
     if let Some(count) = override_count {
         return count.clamp(16, 1024);
     }
-    if limited_ram { 128 } else { IDLE_MOST.0 }
+    IDLE_MOST.0
 }
 
 /// Optional idle expiry TTL in milliseconds (`VICTORY_LIST_POOL_IDLE_S`, `0`
-/// disables TTL), defaulting to `15_000` ms on <=32 GiB hosts.
+/// or unset disables TTL; capped at 600 s).
 #[cfg(windows)]
-fn idle_list_ttl_ms_for(limited_ram: bool, override_s: Option<u64>) -> Option<u64> {
+fn idle_list_ttl_ms_for(_limited_ram: bool, override_s: Option<u64>) -> Option<u64> {
     match override_s {
-        Some(0) => None,
+        Some(0) | None => None,
         Some(s) => Some(s.min(600) * 1000),
-        None if limited_ram => Some(15_000),
-        None => None,
     }
 }
 
@@ -316,7 +315,7 @@ pub(crate) fn trim_idle_lists(now_ms: u64, pressured: bool) {
     if !pressured && ttl.is_none() {
         return;
     }
-    let min_keep = if pressured { 16 } else { 32 };
+    let min_keep = if pressured { 64 } else { 32 };
     let mut dropped = Vec::new();
     {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2522,11 +2521,11 @@ mod tests {
     #[test]
     fn idle_list_bounds_scale_for_limited_ram_and_overrides() {
         assert_eq!(idle_list_most_for(false, None), 512);
-        assert_eq!(idle_list_most_for(true, None), 128);
+        assert_eq!(idle_list_most_for(true, None), 512);
         assert_eq!(idle_list_most_for(true, Some(4)), 16);
         assert_eq!(idle_list_most_for(false, Some(4096)), 1024);
         assert_eq!(idle_list_ttl_ms_for(false, None), None);
-        assert_eq!(idle_list_ttl_ms_for(true, None), Some(15_000));
+        assert_eq!(idle_list_ttl_ms_for(true, None), None);
         assert_eq!(idle_list_ttl_ms_for(true, Some(0)), None);
         assert_eq!(idle_list_ttl_ms_for(false, Some(30)), Some(30_000));
         assert_eq!(idle_list_ttl_ms_for(false, Some(1200)), Some(600_000));
