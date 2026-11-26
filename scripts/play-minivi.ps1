@@ -64,6 +64,9 @@ $settings = @{
     VICTORY_DYNAMIC_SLOTS     = '524288'
     VICTORY_CARD_BUFFERS_MIN_MB = '1'
     VICTORY_CARD_BUFFERS_MB   = '1024'
+    VICTORY_CARD_WINDOWS_MB   = '256'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
+    VICTORY_TEXTURE_ROOM_PERCENT = '92'
     VICTORY_LEVELS_ON_DEMAND  = '1'
     VICTORY_LEVELS_ALL        = '1'
     VICTORY_LEVELS_MAX_DIM    = $maxDim
@@ -83,7 +86,12 @@ if ($Preset -eq 'quality-720p' -or $Preset -eq 'native-1080p') {
 }
 
 $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
-if (-not $RayTracing -and (Test-Path $rtList)) {
+if ($RayTracing) {
+    $settings.VICTORY_RAYS = '1'
+    $settings.VICTORY_RT_MEMORY_MB = '1024'
+    $settings.VICTORY_TEXTURE_MIP_DROP = '1'
+    $settings.VICTORY_CARD_BUFFERS_MB = '768'
+} elseif (Test-Path $rtList) {
     $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }

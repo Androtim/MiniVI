@@ -175,19 +175,38 @@ pub(crate) fn cap_levels(
     kept
 }
 
-fn parse_floor(value: Option<&str>) -> u64 {
-    value
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(1 << 20, |kb| kb.max(64).saturating_mul(1024))
+fn parse_floor_for(value: Option<&str>, vram_budget: Option<u64>) -> u64 {
+    const SMALL_VRAM_CEILING: u64 = 9 << 30;
+    if let Some(kb) = value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return kb.max(64).saturating_mul(1024);
+    }
+    if vram_budget.is_some_and(|budget| budget <= SMALL_VRAM_CEILING) {
+        256 << 10
+    } else {
+        1 << 20
+    }
 }
 
-/// The bytes from which a texture is made this way: a megabyte, or
-/// `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189: the levels not
-/// held are 1.9 MB a copy on some 1,600 copies; a 512x512 texture has six
-/// tiles at most, and most of the calls for nothing.)
+/// The bytes from which a texture is made this way: a megabyte (or 256 KiB on
+/// `<= 9 GiB` GPUs), or `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189:
+/// the levels not held are 1.9 MB a copy on some 1,600 copies; a 512x512
+/// texture has six tiles at most, and most of the calls for nothing.)
 pub(crate) fn floor() -> u64 {
+    static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let value = OVERRIDE
+        .get_or_init(|| std::env::var("VICTORY_LEVELS_MIN_KB").ok())
+        .as_deref();
+    if value.and_then(|v| v.trim().parse::<u64>().ok()).is_some() {
+        return parse_floor_for(value, None);
+    }
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
+    if let Some(&bytes) = BYTES.get() {
+        return bytes;
+    }
+    let Some([budget, ..]) = host().and_then(|h| h.video_memory()) else {
+        return parse_floor_for(None, None);
+    };
+    *BYTES.get_or_init(|| parse_floor_for(None, Some(budget)))
 }
 
 /// The bytes of the tiles given to textures now: the card's memory they
@@ -1642,11 +1661,11 @@ void look() {
 
     #[test]
     fn floor_saturates_instead_of_wrapping() {
-        assert_eq!(parse_floor(None), 1 << 20);
-        assert_eq!(parse_floor(Some("0")), 64 << 10);
-        assert_eq!(parse_floor(Some("2048")), 2048 << 10);
-        assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
-        assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
+        assert_eq!(parse_floor_for(None, None), 1 << 20);
+        assert_eq!(parse_floor_for(Some("0"), None), 64 << 10);
+        assert_eq!(parse_floor_for(Some("2048"), None), 2048 << 10);
+        assert_eq!(parse_floor_for(Some(&(1u64 << 54).to_string()), None), u64::MAX);
+        assert_eq!(parse_floor_for(Some(&u64::MAX.to_string()), None), u64::MAX);
     }
 
     #[test]
@@ -1838,5 +1857,16 @@ void look() {
         assert!(tiled.has_tiles(9), "packed tail must be retained");
         assert_eq!(tiled.first_shown(), Some(1));
         assert!(tiled.given_bytes() < full_bytes);
+    }
+
+    #[test]
+    fn floor_scales_under_9_gib_and_respects_override() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(parse_floor_for(None, Some(8 * GIB)), 256 << 10);
+        assert_eq!(parse_floor_for(None, Some(9 * GIB)), 256 << 10);
+        assert_eq!(parse_floor_for(None, Some(12 * GIB)), 1 << 20);
+        assert_eq!(parse_floor_for(None, None), 1 << 20);
+        assert_eq!(parse_floor_for(Some("512"), Some(8 * GIB)), 512 << 10);
+        assert_eq!(parse_floor_for(Some("16"), Some(16 * GIB)), 64 << 10);
     }
 }

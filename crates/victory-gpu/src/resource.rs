@@ -1246,6 +1246,60 @@ pub(crate) fn held_only() -> bool {
     })
 }
 
+/// Top levels left out of host copies of placed textures the title fills
+/// (`VICTORY_TEXTURE_MIP_DROP=0..3`, `0` if unset: none). Port of `ztrx` PR #84
+/// (`antikohza`, adapted onto held levels): a copy starts at that level, views
+/// below it show it (`descriptor::host::from_base`), uploads read from it.
+#[cfg(windows)]
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        let drop = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(3);
+        if drop > 0 {
+            tracing::info!(
+                mip_drop = drop,
+                min_size = mip_drop_min_size(),
+                levels_on_demand = crate::tiles::wanted(),
+                held_levels = held_only(),
+                "texture mip drop: host copies of placed textures start that many levels down"
+            );
+        }
+        drop
+    })
+}
+
+/// Width and height a texture needs for [`texture_mip_drop`]
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default `1024`).
+#[cfg(windows)]
+fn mip_drop_min_size() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+    })
+}
+
+/// First level of a host copy of `desc` under [`texture_mip_drop`]: `0` under
+/// the minimum size, at least two levels kept, and valid for [`base_level`].
+#[cfg(windows)]
+fn mip_drop_base(desc: &ResourceDesc) -> u32 {
+    mip_drop_base_with(desc, texture_mip_drop(), mip_drop_min_size())
+}
+
+#[cfg(windows)]
+fn mip_drop_base_with(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    if drop == 0 || desc.width < min_size || u64::from(desc.height) < min_size {
+        return 0;
+    }
+    base_level(desc, drop.min(u32::from(desc.mip_levels).saturating_sub(2)))
+}
+
 /// The first level a placed texture's view shows: of views of one 2D
 /// texture (the others show whole textures). After victory-amd 4436f8f1.
 pub(crate) fn first_mip(view: &[u32]) -> u32 {
@@ -1355,7 +1409,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // Never below the levels `VICTORY_TEXTURE_MIP_DROP` leaves out.
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(mip_drop_base(&r.desc)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1554,9 +1609,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
         let all = crate::tiles::all();
+        // `VICTORY_TEXTURE_MIP_DROP` ([`mip_drop_base`]): the host copy
+        // starts that many levels down instead of level-by-level tiling.
+        let dropped = if shape_fits && r.host.placed.load(Relaxed) && alias_of(this).is_none() {
+            mip_drop_base(&r.desc)
+        } else {
+            0
+        };
         if shape_fits
             && r.host.placed.load(Relaxed)
             && crate::tiles::wanted()
+            && dropped == 0
             && (!all || alias_of(this).is_none())
         {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
@@ -1582,15 +1645,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
-        // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
-        let mut base = 0;
+        // The levels views show ([`held_only`]), combined with any
+        // `VICTORY_TEXTURE_MIP_DROP` floor.
+        let mut base = dropped;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
-                base = base_level(&r.desc, first);
+                base = base.max(base_level(&r.desc, first));
             }
         }
         let texture = match texture {
@@ -4634,5 +4697,20 @@ float4 lit() : SV_Target { return 1.0; }
             crate::tiles::Tiled::make(&host.device, &tex, 11).is_some(),
             "reserved texture should produce valid D3D12 subresource tiling"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mip_drop_starts_a_copy_further_down() {
+        // 256x256 BC7, nine levels, 4 KiB blocks.
+        let words = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        // SAFETY: 56 bytes matching `ResourceDesc`'s repr(C) layout.
+        let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        assert_eq!(mip_drop_base_with(&desc, 2, 256), 2);
+        assert_eq!(mip_drop_base_with(&desc, 0, 256), 0);
+        assert_eq!(mip_drop_base_with(&desc, 2, 1024), 0, "under the minimum size");
+        let mut two = desc;
+        two.mip_levels = 2;
+        assert_eq!(mip_drop_base_with(&two, 2, 256), 0, "at least two levels are kept");
     }
 }

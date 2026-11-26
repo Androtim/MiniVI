@@ -225,6 +225,9 @@ struct Block<B> {
     since: u64,
 }
 
+/// Cooldown after a failed block allocation before retrying growth (ms).
+const GROWTH_BACKOFF_MS: u64 = 500;
+
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
@@ -233,11 +236,31 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// Timestamp before which another failed block allocation will not be retried.
+    retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+    }
+
+    /// Allocates a new backing block unless a recent allocation refusal is still
+    /// cooling down, preventing repeated failing driver calls on saturated GPUs.
+    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if now < self.retry_growth_at {
+            return None;
+        }
+        match make() {
+            Some(memory) => {
+                self.retry_growth_at = 0;
+                Some(memory)
+            }
+            None => {
+                self.retry_growth_at = now.saturating_add(GROWTH_BACKOFF_MS);
+                None
+            }
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -282,7 +305,8 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let i = self.add(make()?, ripe.started);
+                let memory = self.grow(now, &mut make)?;
+                let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
@@ -295,7 +319,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
-                && let Some(memory) = make()
+                && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
             }
@@ -747,5 +771,42 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn pool_growth_backs_off_after_refusal() {
+        let mut pool: Pool<u32> = Pool::new(4);
+        let calls = std::cell::Cell::new(0);
+        let allow = std::cell::Cell::new(true);
+        let mut next = 1u32;
+        let mut make = || {
+            calls.set(calls.get() + 1);
+            if allow.get() {
+                let id = next;
+                next += 1;
+                Some(id)
+            } else {
+                None
+            }
+        };
+        // First allocation succeeds and still leaves half the block free.
+        let (first, mem, _) = pool.take(BLOCK / 2, 65536, 100, &mut make).unwrap();
+        assert_eq!((mem, calls.get()), (1, 1));
+        allow.set(false);
+        // Existing free slice in block 1 satisfies another half-block during/before backoff.
+        assert_eq!(pool.take(BLOCK / 2, 65536, 100, &mut make).unwrap().1, 1);
+        // Block 1 is now full; refusal arms 500 ms backoff.
+        assert!(pool.take(BLOCK / 2, 65536, 100, &mut make).is_none());
+        assert_eq!(calls.get(), 2);
+        // Calls inside cooldown must not invoke `make` again, while freeing lets existing space work.
+        assert!(pool.take(BLOCK / 2, 65536, 100 + GROWTH_BACKOFF_MS - 1, &mut make).is_none());
+        assert_eq!(calls.get(), 2);
+        pool.give(first, 100);
+        assert_eq!(pool.take(BLOCK / 2, 65536, 100 + REST, &mut make).unwrap().1, 1);
+        assert_eq!(calls.get(), 2);
+        // After cooldown elapses, growth retries and succeeds.
+        allow.set(true);
+        assert_eq!(pool.take(BLOCK / 2, 65536, 100 + GROWTH_BACKOFF_MS, &mut make).unwrap().1, 2);
+        assert_eq!(calls.get(), 3);
     }
 }

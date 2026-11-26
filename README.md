@@ -11,9 +11,9 @@
 Most recent compatibility forks target 12–24 GB VRAM GPUs and 64 GB RAM workstations. On **8 GB GPUs** (RTX 3060 Ti / 3070 / 4060 / 4060 Ti / 5060, RX 6600 / 7600) and **32 GB RAM** PCs, streaming fills VRAM past the card's DXGI budget, triggering PCIe paging stalls and `DXGI_ERROR_DEVICE_REMOVED` (`0x887A0005`), or hits descriptor-slot limits on NVIDIA's 1,000,000-view heap cap.
 
 ### What MiniVI Adds
-- **Opt-in Top-Mip Dimension Cap (`VICTORY_LEVELS_MAX_DIM=<px>` + `VICTORY_LEVELS_ALL=1`):** skips oversized mips (e.g. >1024 px or >2048 px) cleanly on reserved on-demand textures while retaining packed tail mips and clamping SRV `MostDetailedMip`, cutting texture VRAM usage dramatically without breaking BCn alignment.
+- **Opt-in Top-Mip Dimension Cap (`VICTORY_LEVELS_MAX_DIM=<px>` + `VICTORY_LEVELS_ALL=1`) & Mip Drop (`VICTORY_TEXTURE_MIP_DROP=0..3`):** skips oversized mips (e.g. >1024 px or >2048 px) cleanly on reserved on-demand textures (`VICTORY_LEVELS_MIN_KB` defaults to `256` KiB on `<= 9 GiB` GPUs), or starts huge placed textures (`>= 1024` px by default) a configurable number of mips down (`VICTORY_TEXTURE_MIP_DROP=1` for 8 GB RT), while retaining packed tail mips and clamping SRV `MostDetailedMip`.
 - **Safe Unheld Tile Reclamation (`VICTORY_LEVELS_RECLAIM=1`):** unmaps subresources (`D3D12_TILE_RANGE_FLAG_NULL`) of standard mips no longer held by the title and retires tile runs through the submission fence queue (`host::retire`) before returning them to the pool.
-- **VRAM-Scaled Target Headroom & Pools:** automatically scales render-target headroom (`<= budget / 4` on `<= 9 GiB` cards), texture pre-allocation (`2` ripe blocks / `3` spare blocks on `<= 9 GiB` vs `12`/`64` on large GPUs), and RT card-arena budget (`VICTORY_MEMORY_CARD_MB`, `budget / 4` at 85% headroom on `<= 9 GiB`), plus caps/trims host snapshot/staging pools (`VICTORY_SNAPSHOT_POOL_MB`) on `<= 32 GiB` PCs.
+- **VRAM-Scaled Target Headroom, Pools & RT Arenas:** automatically scales render-target headroom (`<= budget / 4` on `<= 9 GiB` cards), texture pre-allocation (`2` ripe blocks / `3` spare blocks on `<= 9 GiB` vs `12`/`64` on large GPUs) with allocation-refusal cooldown backoff, RT card-arena budget (`VICTORY_MEMORY_CARD_MB`, `budget / 4` at 85% headroom on `<= 9 GiB`), and address-indexed RT BVH page cap (`VICTORY_RT_MEMORY_MB`: `512` MiB on `<= 6 GiB`, `1024` MiB on `<= 9 GiB`, `3072` MiB above), plus caps/trims host snapshot pools (`VICTORY_SNAPSHOT_POOL_MB`) on `<= 32 GiB` PCs.
 - **32 GB Host-RAM Residency Guard (`VICTORY_RESIDENCY=1`):** ports the host-memory pressure monitor and staging/prefetch admission guard from `codec-d/cool_fox` / `VIctory-7900XTX`.
 - **Landed-Flight Descriptor Table Flush (`VICTORY_RELAY_FLUSH_TABLES=1`):** frees dynamic descriptor table slots immediately when GPU flights land instead of holding them behind `bury_lag` (prevents dynamic heap exhaustion on NVIDIA 1M view heaps).
 - **NVIDIA & Visual Quality Base:** builds on `VIctory-NVIDIA` (Series S two-plane UI compose, `VICTORY_DYNAMIC_SLOTS=524288`, `VICTORY_BVH_MISS=1`, `VICTORY_OWN_UPSCALER=1`, `VICTORY_RENDER_SCALE`, `VICTORY_NAN_SCRUB=1`, and RT resolve skip list).
@@ -65,9 +65,11 @@ Double-clickable wrappers are also in `scripts/`:
 
 | Switch | Default | Purpose |
 |---|---|---|
-| `VICTORY_LEVELS_ALL=1` | off | Allows large placed 2D mipmapped textures (`>= VICTORY_LEVELS_MIN_KB`) with already-committed pages to use `CreateReservedResource`. |
+| `VICTORY_LEVELS_ALL=1` | off | Allows large placed 2D mipmapped textures (`>= VICTORY_LEVELS_MIN_KB`, defaulting to `256` KiB on `<= 9 GiB` GPUs vs `1024` KiB above) with already-committed pages to use `CreateReservedResource`. |
 | `VICTORY_LEVELS_MAX_DIM=<px>` | off | Skips mip levels with `max(w, h) > <px>` on on-demand textures (minimum `64`; keeps packed tail). Try `1024` or `2048` on 8 GB GPUs. |
 | `VICTORY_LEVELS_RECLAIM=1` | off | Unmaps standard mips no longer held and returns tiles to the pool safely after GPU fences complete. |
+| `VICTORY_TEXTURE_MIP_DROP` / `_MIN_SIZE` | `0` / `1024` | Starts placed textures `>= MIN_SIZE` px `0..3` mips down on low-VRAM cards (`1` useful when testing `VICTORY_RAYS=1` on 8 GB cards). |
+| `VICTORY_RT_MEMORY_MB` | auto (`512`/`1024`/`3072`) | Caps resident address-indexed RT/BVH arena pages (`512` MiB on `<= 6 GiB`, `1024` MiB on `<= 9 GiB`, `3072` MiB above; clamp `256..=3072`). |
 | `VICTORY_RESIDENCY=1` | off | Enables host RAM / commit pressure throttling for staging buffers and texture prefetch on <=32 GB systems. |
 | `VICTORY_RELAY_FLUSH_TABLES=1` | off | Immediately releases descriptor table slots from landed GPU flights instead of waiting behind `VICTORY_BURY_LAG`. |
 | `VICTORY_SKIP_WC_BACK=1` | off (on in presets) | Safe FPS boost: skips reading back GPU-written data mapped onto write-combining guest memory. |
@@ -99,7 +101,8 @@ Double-clickable wrappers are also in `scripts/`:
 ### Open Caveats / Blockers
 - **Dark interiors & night shadows:** RT GI resolve passes are skipped via `scripts/rt_off_hashes.txt` by default, leaving low-light scenes dim under ambient stand-in values.
 - **Delayed / missing textures under saturated VRAM:** Before the `!reserved` pool bypass fix, crowded scenes showed missing surface textures and occasional untextured/dark character faces during fast camera cuts.
-- **Startup warm-up hitching:** First seconds stall briefly (`~2–3 FPS`) while the D3D12 pipeline library compiles and textures stream in.
+- **Startup warm-up & streaming hitches:** First seconds stall briefly (`~2–3 FPS`) while the D3D12 pipeline library compiles and newly encountered character/scene textures stream in.
+- **Windows TDR (`0x887A0006` without page faults):** With Windows' default 2-second `TdrDelay`, heavy zoom/cutscene bursts on 8 GB cards can trip `DXGI_ERROR_DEVICE_HUNG` even with VRAM headroom available; increasing Windows `TdrDelay` (e.g., `8`–`10` seconds) prevents premature driver resets during complex frames.
 - **NVIDIA-only testing so far:** Tested only on RTX 4060 Ti 8 GB; AMD and Intel GPUs remain untested.
 
 ---
@@ -118,5 +121,6 @@ MiniVI stands on the shoulders of the open-source VIctory ecosystem:
 - **[Marvisak/VIctory](https://github.com/Marvisak/VIctory):** core loader, HLE runtime, D3D12 translation, and shader recompiler.
 - **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA):** NVIDIA capped-heap dynamic slots, Series S UI composition, render-scale / upscaler / watchdog hooks, `VICTORY_BVH_MISS`, NaN scrub, and RT resolve skip list.
 - **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** & **[fxceless/victory-fork](https://github.com/fxceless/victory-fork):** write relay, levels-on-demand (`tiles.rs`), card buffer compares, multithreading, and Series S compose (`#1189`).
+- **Low-VRAM Community Forks:** `antikohza` / [Impre-visible/victory-gtx1660](https://github.com/Impre-visible/victory-gtx1660) (`VICTORY_TEXTURE_MIP_DROP` onto held levels), `miaohaixiang1-netizen/cool-fox-12gb` (refused pool-growth backoff), and `Dolberthi/neptune-dolberth-nvidia-8gb` (streaming/room balance findings).
 - **[codec-d/cool_fox](https://github.com/DoubleGhosty/cool_fox):** 32 GB RAM residency admission & staging pool guards (`residency.rs`).
 - **[ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort), [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD), [DexNom/VIctory](https://github.com/DexNom/VIctory):** title hooks, fast copies, and Wave64/Wave32 shader fixes.
