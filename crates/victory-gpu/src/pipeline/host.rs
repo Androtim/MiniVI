@@ -1538,14 +1538,15 @@ mod tests {
 
         let is_software = {
             use windows::Win32::Graphics::Dxgi::{
-                CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory4,
+                CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+                IDXGIFactory4,
             };
             // SAFETY: valid D3D12 device and DXGI factory query.
             unsafe {
-                CreateDXGIFactory1::<IDXGIFactory4>()
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
                     .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
                     .and_then(|a| a.GetDesc1())
-                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414)
             }
         };
         if is_software {
