@@ -74,10 +74,33 @@ Double-clickable wrappers are also in `scripts/`:
 | `VICTORY_SKIP_WC_COMPARE=1` | off (unsafe) | **Experimental / Unsafe:** skips WC card-before compare passes; upstream reported `DXGI_ERROR_DEVICE_REMOVED` on RTX 5080. |
 | `VICTORY_CENSUS=1` | off | Logs buffer-copy census counters every `VICTORY_CENSUS_SECONDS` seconds (`diag`/logging). |
 | `VICTORY_BAKE_SOURCES` / `_MB` | `1` / `1024` | Pre-uploads decoration bake source textures before bake draws (`VICTORY_BAKE_SOURCES_MB=256` recommended for 8 GB presets). |
-| `VICTORY_AMBIENT_SHADE` / `_REFLECT` | off | Indoor ambient shading (`1.1,0.6`) and reflection balance (`0.65`), enabled in `quality-720p`. |
+| `VICTORY_AMBIENT_SHADE` / `_REFLECT` | off | Indoor ambient shading (`1.2,0.85` in presets) and reflection balance (`0.65`). |
 | `VICTORY_RIPE_BLOCKS` | auto (`2` on `<=9 GiB`, `12` on `>12 GiB`) | Pre-allocated 64 MiB texture pool blocks kept ahead of draws. |
 | `VICTORY_MEMORY_CARD_MB` | auto (`budget/4` on `<=9 GiB`, `4096` on `>12 GiB`) | Max VRAM allocated to address-indexed RT/BVH memory copies before spilling to shared host memory. |
 | `VICTORY_SNAPSHOT_POOL_MB` | auto (`128` on `<=32 GiB`, `512` above) | Max RAM kept in the buffer snapshot pool (trimmed under `VICTORY_RESIDENCY=1` pressure). |
+
+---
+
+## Tested Status & Benchmarks (Self-Reported)
+
+- **Test System (`gpu: [NVIDIA]`):** Intel Core i7-13700F, NVIDIA GeForce RTX 4060 Ti 8 GB (driver `32.0.16.2124`), 32 GB RAM, Windows 11 Home x64.
+- **Profile:** Xbox Series S (`1280x720` internal via `VICTORY_RENDER_SCALE=0.6666667`, own upscaler to `1920x1080`, `scripts/rt_off_hashes.txt` active, no frame generation).
+
+### Verified Milestones (`7c3b0ea`, 23.8-minute continuous session)
+- **`loads` & `boots`:** Binary loads (`0 missing` imports across all modules) and reaches display output.
+- **`menu`:** First-run menus and intro video at **`30.0` FPS median** (`33.3 ms/frame`, `draws < 100`, `n=12` telemetry samples).
+- **`world` & `playable`:** Played cleanly through the opening cutscenes, playable cell, prison yard, bank tutorial, wanted street escape, parking garage sequence, and open-world boat sequence (`14,803+` frames, `0` crashes, `0` `DXGI_ERROR_DEVICE_REMOVED`, `0` refused buffer views).
+
+### Measured Frame Rate & Memory (`7c3b0ea`)
+- **World (`draws >= 1000`, `n=253`):** **`9.7` FPS median / `9.7` avg** (`102.9 ms/frame` median, `1.8–17.7` FPS range; CPU `42.1 ms` avg [`22.5 ms` copies], GPU `54.6 ms` avg, copy-back `5.7 ms` avg, `4,883` draws/frame avg).
+- **Dense open-world (`draws >= 3000`, `n=185`):** **`9.0` FPS median / `8.8` avg** (`111.2 ms/frame` median, `3.7–12.6` FPS range, `5,937` draws/frame avg).
+- **VRAM (`card accounting`):** `7,743 MB` avg / `7,968 MB` peak against `6,599–6,896 MB` DXGI local budget (`room=false` in `264/272` samples). That run revealed `0` tiled host copies because `host_texture_as(..., reserved=true)` was still intercepted by the committed texture pool (`2,132 MB` held in unmapped mip levels), fixed immediately afterwards by bypassing the pool for `reserved` resources (post-fix benchmark pending).
+
+### Open Caveats / Blockers
+- **Dark interiors & night shadows:** RT GI resolve passes are skipped via `scripts/rt_off_hashes.txt` by default, leaving low-light scenes dim under ambient stand-in values.
+- **Delayed / missing textures under saturated VRAM:** Before the `!reserved` pool bypass fix, crowded scenes showed missing surface textures and occasional untextured/dark character faces during fast camera cuts.
+- **Startup warm-up hitching:** First seconds stall briefly (`~2–3 FPS`) while the D3D12 pipeline library compiles and textures stream in.
+- **NVIDIA-only testing so far:** Tested only on RTX 4060 Ti 8 GB; AMD and Intel GPUs remain untested.
 
 ---
 

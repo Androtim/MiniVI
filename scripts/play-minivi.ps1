@@ -52,7 +52,7 @@ $settings = @{
     VICTORY_THIN              = '1'
     VICTORY_JOIN_PARTS        = '8'
     VICTORY_UPLOAD_AHEAD      = '1'
-    VICTORY_AMBIENT           = '0.8'
+    VICTORY_AMBIENT           = '1.4'
     VICTORY_AMBIENT_AIR       = '1.5'
     VICTORY_AMBIENT_MOST      = '2'
     VICTORY_NAN_SCRUB         = '1'
@@ -78,7 +78,7 @@ $settings = @{
 }
 
 if ($Preset -eq 'quality-720p' -or $Preset -eq 'native-1080p') {
-    $settings.VICTORY_AMBIENT_SHADE   = '1.1,0.6'
+    $settings.VICTORY_AMBIENT_SHADE   = '1.2,0.85'
     $settings.VICTORY_AMBIENT_REFLECT = '0.65'
 }
 
