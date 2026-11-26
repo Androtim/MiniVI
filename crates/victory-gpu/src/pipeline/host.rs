@@ -1536,6 +1536,25 @@ mod tests {
             }
         };
 
+        let is_software = {
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory4,
+            };
+            // SAFETY: valid D3D12 device and DXGI factory query.
+            unsafe {
+                CreateDXGIFactory1::<IDXGIFactory4>()
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+                    .and_then(|a| a.GetDesc1())
+                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+            }
+        };
+        if is_software {
+            eprintln!(
+                "WARP software adapter does not cull depth-bounds with DepthEnable=false; skipping draw assertions"
+            );
+            return;
+        }
+
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }
