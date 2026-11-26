@@ -30,4 +30,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --exclude victory-gpu --locked
+          cargo test -p victory-gpu --locked -- --test-threads=1
