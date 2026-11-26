@@ -13,7 +13,7 @@ Most recent compatibility forks target 12–24 GB VRAM GPUs and 64 GB RAM workst
 ### What MiniVI Adds
 - **Opt-in Top-Mip Dimension Cap (`VICTORY_LEVELS_MAX_DIM=<px>` + `VICTORY_LEVELS_ALL=1`):** skips oversized mips (e.g. >1024 px or >2048 px) cleanly on reserved on-demand textures while retaining packed tail mips and clamping SRV `MostDetailedMip`, cutting texture VRAM usage dramatically without breaking BCn alignment.
 - **Safe Unheld Tile Reclamation (`VICTORY_LEVELS_RECLAIM=1`):** unmaps subresources (`D3D12_TILE_RANGE_FLAG_NULL`) of standard mips no longer held by the title and retires tile runs through the submission fence queue (`host::retire`) before returning them to the pool.
-- **VRAM-Scaled Target Headroom (`resource::targets_room_kept`):** automatically scales reserved render-target headroom to `<= budget / 4` on `<= 9 GiB` GPUs unless overridden by `VICTORY_CARD_ROOM_FOR_TARGETS_MB`.
+- **VRAM-Scaled Target Headroom & Pools:** automatically scales render-target headroom (`<= budget / 4` on `<= 9 GiB` cards), texture pre-allocation (`2` ripe blocks / `3` spare blocks on `<= 9 GiB` vs `12`/`64` on large GPUs), and RT card-arena budget (`VICTORY_MEMORY_CARD_MB`, `budget / 4` at 85% headroom on `<= 9 GiB`), plus caps/trims host snapshot/staging pools (`VICTORY_SNAPSHOT_POOL_MB`) on `<= 32 GiB` PCs.
 - **32 GB Host-RAM Residency Guard (`VICTORY_RESIDENCY=1`):** ports the host-memory pressure monitor and staging/prefetch admission guard from `codec-d/cool_fox` / `VIctory-7900XTX`.
 - **Landed-Flight Descriptor Table Flush (`VICTORY_RELAY_FLUSH_TABLES=1`):** frees dynamic descriptor table slots immediately when GPU flights land instead of holding them behind `bury_lag` (prevents dynamic heap exhaustion on NVIDIA 1M view heaps).
 - **NVIDIA & Visual Quality Base:** builds on `VIctory-NVIDIA` (Series S two-plane UI compose, `VICTORY_DYNAMIC_SLOTS=524288`, `VICTORY_BVH_MISS=1`, `VICTORY_OWN_UPSCALER=1`, `VICTORY_RENDER_SCALE`, `VICTORY_NAN_SCRUB=1`, and RT resolve skip list).
@@ -75,6 +75,9 @@ Double-clickable wrappers are also in `scripts/`:
 | `VICTORY_CENSUS=1` | off | Logs buffer-copy census counters every `VICTORY_CENSUS_SECONDS` seconds (`diag`/logging). |
 | `VICTORY_BAKE_SOURCES` / `_MB` | `1` / `1024` | Pre-uploads decoration bake source textures before bake draws (`VICTORY_BAKE_SOURCES_MB=256` recommended for 8 GB presets). |
 | `VICTORY_AMBIENT_SHADE` / `_REFLECT` | off | Indoor ambient shading (`1.1,0.6`) and reflection balance (`0.65`), enabled in `quality-720p`. |
+| `VICTORY_RIPE_BLOCKS` | auto (`2` on `<=9 GiB`, `12` on `>12 GiB`) | Pre-allocated 64 MiB texture pool blocks kept ahead of draws. |
+| `VICTORY_MEMORY_CARD_MB` | auto (`budget/4` on `<=9 GiB`, `4096` on `>12 GiB`) | Max VRAM allocated to address-indexed RT/BVH memory copies before spilling to shared host memory. |
+| `VICTORY_SNAPSHOT_POOL_MB` | auto (`128` on `<=32 GiB`, `512` above) | Max RAM kept in the buffer snapshot pool (trimmed under `VICTORY_RESIDENCY=1` pressure). |
 
 ---
 
