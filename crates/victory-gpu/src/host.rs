@@ -437,6 +437,7 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
+    crate::list::trim_idle_lists(now, crate::residency::pressured());
     if crate::residency::pressured() {
         trim_spare_chunks();
         crate::shadow::trim_snapshot_pool();

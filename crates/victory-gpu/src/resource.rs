@@ -1397,7 +1397,7 @@ pub(crate) static HELD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::
 #[cfg(windows)]
 pub(crate) fn want_level(this: This, first: u32) {
     use std::sync::atomic::Ordering::Relaxed;
-    if this.is_null() || !held_only() {
+    if this.is_null() || !(held_only() || texture_mip_drop() > 0) {
         return;
     }
     let r = resource(this);
@@ -1648,7 +1648,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), combined with any
         // `VICTORY_TEXTURE_MIP_DROP` floor.
         let mut base = dropped;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if shape_fits && r.host.placed.load(Relaxed) && (held_only() || dropped > 0) && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);

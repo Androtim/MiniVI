@@ -227,11 +227,27 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+fn staging_bytes_for(requested: u32, override_mb: Option<u64>) -> u64 {
+    let floor = override_mb.map_or(0, |mb| mb.clamp(32, 256) << 20);
+    u64::from(requested).max(floor)
+}
+
+fn staging_floor_mb() -> Option<u64> {
+    static FLOOR: OnceLock<Option<u64>> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// The title asks for 32 MiB and stops if this fails; `VICTORY_DSTORAGE_STAGING_MB`
+/// raises the floor (`32..=256` MiB) so cutscene and scene transitions overlap more reads.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let effective = staging_bytes_for(size, staging_floor_mb());
+    tracing::info!(size, effective, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = effective;
     }
     S_OK
 }
@@ -604,7 +620,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_bytes_for(STAGING as u32, staging_floor_mb()),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -2542,5 +2558,14 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn staging_floor_raises_but_clamps_budget() {
+        assert_eq!(staging_bytes_for(32 << 20, None), 32 << 20);
+        assert_eq!(staging_bytes_for(32 << 20, Some(64)), 64 << 20);
+        assert_eq!(staging_bytes_for(32 << 20, Some(8)), 32 << 20);
+        assert_eq!(staging_bytes_for(32 << 20, Some(1024)), 256 << 20);
+        assert_eq!(staging_bytes_for(128 << 20, Some(64)), 128 << 20);
     }
 }
