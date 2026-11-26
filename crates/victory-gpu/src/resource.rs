@@ -2485,8 +2485,10 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Never intercept reserved textures intended for
+    // levels-on-demand tiling (`crate::tiles`), or they cannot use reserved heaps.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -4599,5 +4601,38 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A reserved texture request must bypass the committed texture pool so
+    /// `CreateReservedResource` still backs `crate::tiles::Tiled::make`.
+    #[cfg(windows)]
+    #[test]
+    fn reserved_host_texture_bypasses_texture_pool() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 1024,
+            height: 1024,
+            depth_or_array_size: 1,
+            mip_levels: 11,
+            format: 98, // DXGI_FORMAT_BC7_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x105,
+            flags: 0,
+        };
+        let Some(tex) = host_texture_as(&desc, 0, std::ptr::null(), true) else {
+            return;
+        };
+        // SAFETY: valid live D3D12 resource just created with `CreateReservedResource`.
+        let layout = unsafe { tex.GetDesc().Layout };
+        assert_eq!(layout, windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+        assert!(
+            crate::tiles::Tiled::make(&host.device, &tex, 11).is_some(),
+            "reserved texture should produce valid D3D12 subresource tiling"
+        );
     }
 }
