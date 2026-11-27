@@ -114,7 +114,28 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
+fn parse_leave_out(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect()
+}
+
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .map(|value| parse_leave_out(&value))
+            .unwrap_or_default()
+    })
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let skip = leave_out();
+    if !skip.is_empty() && shaders.iter().any(|s| skip.contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -959,5 +980,14 @@ mod tests {
         assert!(!is_rt_trace_bytes(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."));
         assert!(!is_rt_trace_bytes(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."));
         assert!(!is_rt_trace_bytes(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."));
+    }
+
+    #[test]
+    fn leave_out_parses_16_hex_hashes() {
+        assert_eq!(
+            parse_leave_out(" 02384A60FDA6F2D0, bad, 731a39171b568298\n0123456789abcdeg "),
+            vec!["02384a60fda6f2d0", "731a39171b568298"]
+        );
+        assert!(parse_leave_out("").is_empty());
     }
 }

@@ -115,7 +115,14 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Writing texture read-backs into title memory (`texback::write`, on
+    /// its own thread unless `VICTORY_TEXBACK_ASYNC=0`): wait, work, written,
+    /// and coalesced replacements.
+    pub(crate) const TB_WAIT: usize = 26;
+    pub(crate) const TB_WORK: usize = 27;
+    pub(crate) const TB_WRITTEN: usize = 28;
+    pub(crate) const TB_REPLACED: usize = 29;
+    pub(crate) const COUNT: usize = 30;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -172,6 +179,17 @@ pub(crate) fn log(frames: f64) {
         ms(stat::TOLD),
         ms(stat::REST),
     );
+    if s[stat::TB_WRITTEN] > 0.0 || s[stat::TB_REPLACED] > 0.0 {
+        tracing::info!(
+            "texture read-backs written per frame (VICTORY_TEXBACK_ASYNC={}): {:.1}, {:.1} replaced by a newer one first; \
+             waiting for the mapping locks {:.2} ms, tiling and writing {:.2} ms",
+            u8::from(std::env::var_os("VICTORY_TEXBACK_ASYNC").is_none_or(|v| v != "0")),
+            s[stat::TB_WRITTEN],
+            s[stat::TB_REPLACED],
+            ms(stat::TB_WAIT),
+            ms(stat::TB_WORK),
+        );
+    }
     tracing::info!(
         "landed per frame: {:.0} pieces, {:.0} with a new byte; of their {:.0} pages of 4 KiB {:.0} with a new byte ({:.1} MB), \
          {:.1} MB in blocks of 32 bytes with one, {:.2} MB put as dwords; {:.0} pieces through a view of ours \
