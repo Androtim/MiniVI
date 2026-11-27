@@ -69,6 +69,12 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_UPLOAD_AHEAD", "1"),
     ("VICTORY_SHOW_AFTER", "1"),
     ("VICTORY_MAP_THREADS", "1"),
+    // A frame's texture passes within 8 ms together; helpers woken at each submission's start
+    // (foxhound 0.2.0-pre.4, from its PR #13; its launcher sets 8 and 1)
+    ("VICTORY_TEXSPK_PASS_MS", "8"),
+    ("VICTORY_PASSES_HOT", "1"),
+    // The layer's threads a frame waits for, above normal priority (foxhound: cutscene worst second 74.8 -> 63.8 ms)
+    ("VICTORY_HELPER_PRIORITY", "1"),
     // Shader writes into big write-combined copies stay on the card
     ("VICTORY_WC_NO_BACK", "1"),
     ("VICTORY_WC_NO_BACK_MIN_KB", "1024"),
@@ -195,8 +201,11 @@ pub(crate) fn preload(exe: &Path) {
     }
 }
 
-/// `%LOCALAPPDATA%\victory`.
+/// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names.
 fn home() -> Result<PathBuf> {
+    if let Some(home) = victory_core::config::home_override() {
+        return Ok(home);
+    }
     let base = std::env::var_os("LOCALAPPDATA").context("no %LOCALAPPDATA% to keep settings and logs in")?;
     Ok(PathBuf::from(base).join("victory"))
 }
@@ -657,18 +666,33 @@ pub(crate) fn get_d3d12() -> Result<()> {
 /// Microsoft's newer runtime is fetched beside this program, after asking.
 /// Below 6.6 every pipeline is refused and the title closes within seconds,
 /// so a start that still cannot run it stops here, saying why.
+///
+/// On Windows 10 the runtime is fetched even where its own reports 6.6 or
+/// more (an up-to-date driver says 6.8): Windows 10's own Direct3D 12
+/// refuses the root signatures the translated shaders need (descriptor
+/// heaps indexed directly), and the title closed a second after its first
+/// frame (2026-11-27, Windows 10 21H2 LTSC with an RTX 4060, issue #290;
+/// #123 and discussion #186 found the same refusal).
 fn check_shader_model() -> Result<()> {
     let needed = victory_hle::streamline::SHADER_MODEL_NEEDED;
     let Some(found) = shader_model() else { return Ok(()) };
-    if found >= needed {
-        return Ok(());
-    }
     let to = d3d12_dir()?;
     let had = to.join("D3D12Core.dll").is_file();
+    let windows_10 = !had && crate::windows_build().is_some_and(|build| build < 22000);
+    if found >= needed && !windows_10 {
+        return Ok(());
+    }
     if !had {
-        println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
-        println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
-        println!("runs 6.6. It is Microsoft's own, under Microsoft's licence, from nuget.org (about 22 MB, once),");
+        if found < needed {
+            println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
+            println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
+            println!("runs 6.6.");
+        } else {
+            println!("This is Windows 10: its own Direct3D 12 refuses root signatures the game's translated shaders");
+            println!("need, and the game would close at the start. Microsoft's newer runtime (the D3D12 Agility SDK)");
+            println!("takes them.");
+        }
+        println!("It is Microsoft's own, under Microsoft's licence, from nuget.org (about 22 MB, once),");
         println!("and goes into {}.", to.display());
         let yes = if std::io::stdin().is_terminal() {
             print!("Download it now? [Y/n] ");
@@ -681,19 +705,29 @@ fn check_shader_model() -> Result<()> {
         };
         if yes {
             match fetch_d3d12(&to) {
-                Ok(()) => match shader_model() {
-                    Some(now) if now >= needed => {
-                        println!("Shader model {}.{} with Microsoft's runtime. Starting the game.", now.0, now.1);
-                        return Ok(());
+                Ok(()) => {
+                    // This process is yet to load Direct3D 12: it asks for the file now there.
+                    crate::match_d3d12_core();
+                    let res = shader_model();
+                    match res {
+                        Some(now) if now >= needed => {
+                            println!("Shader model {}.{} with Microsoft's runtime. Starting the game.", now.0, now.1);
+                            return Ok(());
+                        }
+                        now => {
+                            let now = now.unwrap_or(found);
+                            println!("With Microsoft's runtime the GPU still runs shader model {}.{}.", now.0, now.1);
+                        }
                     }
-                    now => {
-                        let now = now.unwrap_or(found);
-                        println!("With Microsoft's runtime the GPU still runs shader model {}.{}.", now.0, now.1);
-                    }
-                },
+                }
                 Err(e) => println!("{e:#}"),
             }
         }
+    }
+    if found >= needed {
+        println!("Starting with Windows 10's own Direct3D 12: the game may close at the start.");
+        println!("`victory get-d3d12` fetches Microsoft's newer runtime later.");
+        return Ok(());
     }
     let now = shader_model().unwrap_or(found);
     anyhow::bail!(
@@ -720,7 +754,7 @@ fn mod_dlls(here: &Path) -> Vec<String> {
 }
 
 /// How long the first start of a new victory.exe plays before it restarts.
-const WARMUP_SECONDS: u32 = 20;
+const WARMUP_SECONDS: u32 = 30;
 
 /// The file that says this victory.exe (its bytes) had its warm-up start:
 /// `%LOCALAPPDATA%\victory\warmed\<hash>`. `None`: the exe could not be read.
@@ -812,8 +846,8 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         && let Some(mark) = warmup_mark(&home, &program)
         && !mark.exists()
     {
-        println!("First start of this version of victory.exe: the game restarts by itself after {WARMUP_SECONDS} seconds,");
-        println!("once (a new version's first run otherwise stays at about 14 fps).");
+        println!("First start of this version of victory.exe: the game restarts by itself {WARMUP_SECONDS} seconds after it");
+        println!("loads into the game (press A at the title screen), once (a new version's first run otherwise stays at about 14 fps).");
         s.insert("VICTORY_WARMUP_RESTART".to_owned(), WARMUP_SECONDS.to_string());
         s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
     }

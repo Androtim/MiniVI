@@ -1,6 +1,6 @@
 # MiniVI
 
-**MiniVI** is an experimental **Xbox Series** (**Scarlett** / **GDK**) Windows compatibility layer tuned for **8 GB VRAM** GPUs and **16–32 GB system RAM** hosts. Rebased onto [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) (`foxhound` base, commit `0cef07e`), MiniVI combines upstream CPU/texqueue speedups, NVIDIA DLSS Super Resolution, 2x–6x DLSS / FSR 3 Frame Generation, the `F1` settings menu, and the `F3` telemetry overlay with strict DXGI VRAM governance, level-by-level reserved mip streaming, title hang-watchdog disarmament, and BVH traversal fixes.
+**MiniVI** is an experimental **Xbox Series** (**Scarlett** / **GDK**) Windows compatibility layer tuned for **8 GB VRAM** GPUs and **16–32 GB system RAM** hosts. Rebased onto [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) (`foxhound` base, commit `64d4931`), MiniVI combines upstream CPU/texqueue speedups, NVIDIA DLSS Super Resolution, 2x–6x DLSS / FSR 3 Frame Generation, water lighting (`VICTORY_LOOPS_WAVE`), Audio DSP mono convolutions, DualSense + DualShock 4 rumble, the `F1` instant-save settings menu, and the `F3` telemetry overlay with strict DXGI VRAM governance, level-by-level reserved mip streaming, title hang-watchdog disarmament, and BVH traversal fixes.
 
 > **Strictly Clean-Room / Source-Only Repository:** Zero game executables, asset archives, keys, screenshots, or binary artifacts are stored here. Users supply their own legally owned runtime executable and data directory locally. Automated `cargo test -p xtask` policy checks block leaked binaries or prohibited strings on every commit. See [docs/asset-policy.md](docs/asset-policy.md).
 
@@ -24,11 +24,11 @@
 | GPU Tier | Upscaling | Frame Generation | Notes |
 |---|---|---|---|
 | GeForce RTX 40 / 50 | DLSS Super Resolution (`quality`/`balanced`/`performance`/`dlaa`) | **DLSS Frame Generation** (`2x` on RTX 40, up to `6x` on RTX 50) | Run `.\scripts\get-nvidia-sdks.ps1` or `.\Get-NVIDIA-DLSS.cmd` once to fetch NVIDIA's runtime DLLs (`nvidia-sdk\`, git-ignored) |
-| GeForce RTX 20 / 30 | DLSS Super Resolution | **AMD FSR 3 Frame Generation** (`2x`) | Run `.\scripts\get-amd-fsr.ps1` / `victory get-fsr` (or optional MFG Unlocker via `F1`) |
+| GeForce RTX 20 / 30 | DLSS Super Resolution | **AMD FSR 3 Frame Generation** (`2x`, requires DLSS upscaling) | Run `.\scripts\get-amd-fsr.ps1` / `victory get-fsr` (or optional MFG Unlocker via `F1`) |
 | AMD Radeon / Other | Title upscaler (`VICTORY_UPSCALER=6`) | **AMD FSR 3 Frame Generation** (`2x`, Series S profile) | Use `scripts\play-minivi.ps1 -Amd` |
 
-- Press **`F1`** in-game for the live settings menu (DLSS mode/preset, Frame Generation toggle & multiplier, console profile, water-light mode, saved to `victory-settings.txt`).
-- Press **`F3`** in-game for the FPS, frame-time, draw count, CPU/GPU timing, RAM, and VRAM panel.
+- Press **`F1`** in-game for the live settings menu (changes save immediately to `victory-settings.txt` in `VICTORY_HOME` or `%LOCALAPPDATA%\victory`).
+- Set `VICTORY_HOME` (e.g., `setx VICTORY_HOME D:\victory`) to relocate settings, saves, caches, and logs off `C:`.
 - On **Windows 10**, Shader Model 6.6 requires the D3D12 Agility SDK (`.\scripts\get-d3d12.ps1` or `victory get-d3d12`).
 
 ---

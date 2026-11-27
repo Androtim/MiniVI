@@ -1,0 +1,36 @@
+# Asks for the logs when a new issue has none: no attached file and no pasted log lines.
+name: needs-logs
+on:
+  issues:
+    types: [opened]
+permissions:
+  issues: write
+jobs:
+  ask:
+    if: github.event.issue.user.login != github.repository_owner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REPLY: |
+            Please attach both logs from the run that went wrong so we can investigate without guessing. Paste `%LOCALAPPDATA%` into the File Explorer address bar to find them:
+
+            1. **Play log** in `%LOCALAPPDATA%\victory\logs\`: the newest `.log` from that run (the console prints its path at startup on the `Log: ...` line).
+            2. **Crash log**: `%LOCALAPPDATA%\VIctory\data\7952987A\crashes.log`, and if present, the newest `.crash.log` in `%LOCALAPPDATA%\VIctory\data\7952987A\temp\`.
+
+            Please also include:
+            - **GPU & VRAM**, **Windows version** (10 or 11)
+            - **MiniVI preset / launcher flags** (`play-minivi.ps1` preset, DLSS/FG/RT, custom `VICTORY_*` vars) and **commit SHA**
+
+            *(Clean-room policy: please only attach text logs/screenshots — do not upload copyrighted game files or executables.)*
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+            // An attached file (GitHub's upload links) or pasted log/telemetry lines count as logs.
+            const attached = /https:\/\/github\.com\/(user-attachments\/files|[^\/\s]+\/[^\/\s]+\/files)\//.test(body);
+            const pasted = /victory_gpu::|victory_hle::|victory[-_]shader|unhandled exception|crashes\.log:|DXGI_ERROR_DEVICE|\bDRED\b|\bF3\b[^\n]{0,40}\b(FPS|VRAM)\b|\b(INFO|WARN|ERROR)\s+victory|\.(dll|exe)\+0x[0-9a-f]+|\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d/i.test(body);
+            if (attached || pasted) return;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body: process.env.REPLY,
+            });
