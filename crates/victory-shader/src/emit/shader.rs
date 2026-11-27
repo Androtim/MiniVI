@@ -108,8 +108,9 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
-    pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    pub const EARLY_DEPTH_STENCIL: u64 = 1 << 3;
+    pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// Unordered views in a vertex, geometry or mesh program.
