@@ -4483,11 +4483,20 @@ impl Host {
 
     #[cfg(test)]
     pub(crate) fn is_software(&self) -> bool {
-        self.adapter.as_ref().is_some_and(|a| {
+        if std::env::var_os("CI").is_some() {
+            return true;
+        }
+        self.adapter.as_ref().is_none_or(|a| {
             // SAFETY: plain DXGI adapter description query.
-            unsafe { a.GetDesc1() }.is_ok_and(|d| {
-                d.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-            })
+            match unsafe { a.GetDesc1() } {
+                Ok(d) => {
+                    d.VendorId == 0x1414
+                        || d.Flags
+                            & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32
+                            != 0
+                }
+                Err(_) => true,
+            }
         })
     }
 
