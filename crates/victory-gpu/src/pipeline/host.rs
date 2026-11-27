@@ -1022,6 +1022,17 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The text of a D3D blob (the serializer's reason for a refusal).
+pub(crate) fn blob_text(blob: &ID3DBlob) -> String {
+    // SAFETY: the blob's own buffer, read before the blob is released.
+    let text = unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    };
+    String::from_utf8_lossy(text)
+        .trim_end_matches(['\0', '\n'])
+        .to_owned()
+}
+
 /// Whether the D3D12 runtime accepts the directly-indexed heap flags
 /// (CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED).
 /// Probed once with an empty root signature; false on runtimes that
@@ -1097,11 +1108,7 @@ fn root_signature(
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
             if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
-                    error.GetBufferPointer().cast::<u8>(),
-                    error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                tracing::warn!("root signature: {}", blob_text(&error));
             }
             return Err(e);
         }
