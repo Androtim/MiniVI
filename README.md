@@ -16,6 +16,8 @@ Experimental compatibility layer and shader translation runtime for running Xbox
   - Panic-safe pipeline worker queue (`Pending::make_with`) so a failed translation never hangs waiting threads.
   - `submit_split` dynamic descriptor slot release (`list::tables_done`) and `alias_of` reference pinning (`Held` guard) to prevent slot exhaustion and use-after-free during async texture aliasing.
   - DirectStorage staging buffer cleanup and idle list/upload trimming (`VICTORY_LIST_IDLE_TRIM_S`).
+  - Bindless heap root-signature flags (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`, `SAMPLER_HEAP_DIRECTLY_INDEXED`) are now probed at startup and omitted on runtimes that reject them, fixing "Unsupported bit-flag set" errors on older D3D12 runtimes.
+  - Offline batch shader translator (`victory shaders`) catches panics per-shader so a single void-value assert no longer kills the entire translation run.
 - **Shader & Ray Tracing Fixes:**
   - Shader LOD slot fix (leaves unused LOD slots undefined in array texture coordinate queries to pass DXIL validation).
   - Wave32 cascade lowering, scoped submerged shader lowering, and dynamic view address buffer indexing (`SLOT_VIEW_ADDRESSES`) for ray-tracing BVH descriptors.
