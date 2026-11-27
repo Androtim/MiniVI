@@ -464,6 +464,10 @@ thread_local! {
     static PER_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+pub(crate) fn is_per_lane() -> bool {
+    PER_LANE.get()
+}
+
 /// Runs `f` with the branches on a mask operation's SCC split per lane, each lane by its own
 /// bit ([`Structured::wave_scc`] left empty), as before #66: inexact where an arm runs lanes
 /// whose own bit went the other way, but a program whose wave-wide form does not translate

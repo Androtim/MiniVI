@@ -1580,9 +1580,12 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
-    // A scalar select or branch uses the condition of the whole guest wave,
-    // even when the preceding mask operation has no scalar-dword consumers.
-    if matches!(i.fields, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Valu(_))
+    // A scalar select or wave-wide SCC branch uses the condition of the whole
+    // guest wave, even when the preceding mask operation has no scalar-dword consumers.
+    let scc_branch = !crate::structure::is_per_lane()
+        && !st.wave_scc.is_empty()
+        && matches!(i.fields, Fields::Sopp { .. });
+    if (scc_branch || matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_)))
         && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
     {
         return true;
@@ -2649,7 +2652,7 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        if !self.local && !self.exchange.as_ref().is_some_and(|e| e.1) && self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");

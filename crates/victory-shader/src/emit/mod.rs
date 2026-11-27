@@ -608,15 +608,16 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     let exact = emit_forms(c, native, p, st, io, res);
     // A branch on a mask operation's SCC is the wave's ([`structure::Structured::wave_scc`],
-    // #66) and needs every lane where it stands. A program none of whose forms gives it that
-    // is taken with those branches split per lane, as before #66: inexact where an arm runs
-    // lanes whose own bit went the other way, but drawn. Dropped, its dispatch leaves what
-    // it writes unwritten, and the title read that back as a pointer: a write to 0 at
-    // +0x23cf683 loading the boat cutscene (#80) right after `ff6fdf23ce0b9048` failed so.
+    // #66) and needs every lane where it stands. A program none of whose forms translates with
+    // it wave-wide — whether the original program returned `WAVE_WIDE_ELSEWHERE` directly or an
+    // earlier refusal fell through retries that hit `wave_scc` — is tried again with those
+    // branches split per lane, as before #66: inexact where an arm runs lanes whose own bit went
+    // the other way, but drawn instead of dropped (#80).
     // `VICTORY_LANE_SPLIT=exact` refuses such a program instead.
-    let refused_wide = matches!(&exact,
-        Err(ShaderError::Unsupported { what, .. }) if *what == lower::WAVE_WIDE_ELSEWHERE);
-    if !refused_wide || st.wave_scc.is_empty() || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact") {
+    if exact.is_ok()
+        || st.wave_scc.is_empty()
+        || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact")
+    {
         return exact;
     }
     let again = structure::with_per_lane(|| {

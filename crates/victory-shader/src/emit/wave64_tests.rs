@@ -1242,31 +1242,33 @@ fn both_arms_of_a_wave_wide_scc_branch_keep_their_store_guards() {
     }
 }
 
+const MASK_SCC_BEHIND_SKIP: &[u32] = &[
+    0xBF8C_0000, // s_waitcnt 0: the descriptor
+    0xBE94_0380, // s_mov_b32 s20, 0
+    0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+    0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    0xBF88_000A, // s_cbranch_execz to the restore
+    0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+    0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+    0xBE94_0387, // s_mov_b32 s20, 7
+    0xBF84_0002, // s_cbranch_scc0 to the value 1
+    0x7E04_0282, // v_mov_b32 v2, 2
+    0xBF82_0001, // s_branch to the store
+    0x7E04_0281, // v_mov_b32 v2, 1
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xE070_1000,
+    0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    0x7E06_0214, // v_mov_b32 v3, s20
+    0xE070_1000,
+    0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+];
+
 /// The issue's branch-only program (#66) with an EXEC skip that cannot be left out: the
 /// skipped code sets s20, which the code after the join stores. The branch on the mask's
 /// SCC then stands where not every lane runs, in every form.
 fn mask_scc_behind_a_kept_skip() -> NativeProgram {
-    native(&[
-        0xBF8C_0000, // s_waitcnt 0: the descriptor
-        0xBE94_0380, // s_mov_b32 s20, 0
-        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
-        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
-        0xBF88_000A, // s_cbranch_execz to the restore
-        0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
-        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
-        0xBE94_0387, // s_mov_b32 s20, 7
-        0xBF84_0002, // s_cbranch_scc0 to the value 1
-        0x7E04_0282, // v_mov_b32 v2, 2
-        0xBF82_0001, // s_branch to the store
-        0x7E04_0281, // v_mov_b32 v2, 1
-        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xE070_1000,
-        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
-        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
-        0x7E06_0214, // v_mov_b32 v3, s20
-        0xE070_1000,
-        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
-    ])
+    native(MASK_SCC_BEHIND_SKIP)
 }
 
 /// A program none of whose forms can take a branch on a mask's SCC wave-wide is translated
@@ -1293,6 +1295,49 @@ fn a_wave_wide_scc_branch_no_form_can_take_falls_back_to_the_per_lane_split() {
         exact.err()
     );
     let shader = shader.expect("split per lane, the program translates");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+}
+
+/// When the original lowering refuses for a first-lane read inside a kept EXEC skip while
+/// local-wave retries are blocked by a `wave_scc` branch, `emit` still retries with those
+/// SCC branches split per lane instead of returning the earlier refusal untouched.
+#[test]
+fn a_divergent_first_lane_with_wave_scc_retry_block_falls_back_to_per_lane_split() {
+    let mut code = MASK_SCC_BEHIND_SKIP.to_vec();
+    // Replace `s_mov_b32 s20, 7` (inside the kept EXEC skip) with `v_readfirstlane_b32 s20, v0`
+    // and store it inside the same block before `s_cbranch_scc0`, so the original pass refuses
+    // at that first-lane read while local-wave retries hit `wave_scc`, and extend `s_cbranch_execz`
+    // by 3 dwords to keep the restore target.
+    code[4] = 0xBF88_000D;
+    code[7] = 0x7E28_0500;
+    code.splice(
+        8..8,
+        [
+            0x7E08_0214, // v_mov_b32 v4, s20
+            0xE070_1000,
+            0x8002_0400, // buffer_store_dword v4, v0, s[8:11], 0 offen
+        ],
+    );
+    let native = native(&code);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    assert!(ir::without_skips(&p, false).is_none(), "the skip stays kept");
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(st.wave_scc.len(), 1);
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("io");
+    let c = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let exact = super::emit_forms(&c, &native, &p, &st, &io, &res);
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    assert!(
+        matches!(&exact, Err(ShaderError::Unsupported { what, .. }) if *what == "a first-lane read where not every lane runs"),
+        "{:?}",
+        exact.err()
+    );
+    let shader = shader.expect("per-lane split lowers what local-wave retries hit wave_scc on");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
     }
