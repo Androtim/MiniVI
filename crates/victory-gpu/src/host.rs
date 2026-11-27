@@ -2917,6 +2917,9 @@ struct Deferred {
     back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
+    /// Title textures whose upload the list copies from what the card
+    /// detiles in its prelude (`crate::gpudetile`), in recorded order.
+    detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -6330,7 +6333,7 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(this_submission) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -7300,6 +7303,13 @@ impl HostList {
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
 
+    /// The list's copies of a title texture read what the card detiles
+    /// from its staging buffer (`crate::gpudetile`): the list's prelude
+    /// records the detiling at submission.
+    pub(crate) fn detile_first(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().detiles.push(staging);
+    }
+
     /// Before the list closes: the depth textures whose twins it wrote last
     /// are given what was written, and left readable by shaders. Shaders
     /// that pick a view from the heap by a computed index are not seen by
@@ -7406,7 +7416,8 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, submission: u64) -> Option<ID3D12CommandList> {
+        let detiles: Vec<_> = self.deferred().detiles.clone();
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7467,7 +7478,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && detiles.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -7490,6 +7501,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                for staging in &detiles {
+                    staging.record_detile(list, submission);
                 }
                 list.Close()
             })
@@ -9864,6 +9878,32 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
                      {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
                      with less than was mapped (looked at again)"
+                );
+            }
+            let [cpu_us, cpu_bytes, cpu_textures] =
+                [0, 1, 2].map(|i| crate::texture::DETILED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [card_textures, card_dispatches, card_bytes, card_us, card_made, card_refused] =
+                std::array::from_fn::<f64, 6, _>(|i| crate::gpudetile::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let modes: Vec<String> = crate::texture::BY_MODE
+                .iter()
+                .enumerate()
+                .filter_map(|(mode, bytes)| {
+                    let mb = bytes.swap(0, Ordering::Relaxed) as f64 / frames / 1e6;
+                    (mb >= 0.05).then(|| format!("{} {mb:.1}", victory_formats::texture::Swizzle(mode as u32).name()))
+                })
+                .collect();
+            if cpu_bytes + card_bytes > 0.0 {
+                tracing::info!(
+                    "texture detiling per frame: on the PC {:.2} ms for {:.1} MB ({cpu_textures:.1} textures); on the card \
+                     (VICTORY_GPU_DETILE={}) {card_textures:.1} textures in {card_dispatches:.0} dispatches, the PC copying \
+                     {:.1} MB as laid out in {:.2} ms, {card_made:.1} stagings made for the card, {card_refused:.1} refused; \
+                     MB by swizzle mode: {}",
+                    cpu_us / 1e3,
+                    cpu_bytes / 1e6,
+                    std::env::var("VICTORY_GPU_DETILE").unwrap_or_else(|_| "0".into()),
+                    card_bytes / 1e6,
+                    card_us / 1e3,
+                    modes.join(", ")
                 );
             }
         }
