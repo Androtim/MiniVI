@@ -1462,6 +1462,10 @@ mod tests {
             }
         };
 
+        if host.is_software() {
+            eprintln!("software WARP adapter ignores OMSetDepthBounds when DepthEnable=false; draw check skipped");
+            return;
+        }
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }

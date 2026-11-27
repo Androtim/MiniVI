@@ -4481,6 +4481,16 @@ impl Host {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_software(&self) -> bool {
+        self.adapter.as_ref().is_some_and(|a| {
+            // SAFETY: plain DXGI adapter description query.
+            unsafe { a.GetDesc1() }.is_ok_and(|d| {
+                d.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+            })
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
