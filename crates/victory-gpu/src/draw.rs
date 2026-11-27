@@ -2522,6 +2522,20 @@ impl State {
                 crate::texture::BAKING.set(exact);
                 self.flush_for_bake(bake_list, host, Some(&mut sync));
                 let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+                if left == 0 {
+                    static SPENT_OUT: AtomicU64 = AtomicU64::new(0);
+                    let n = SPENT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 64 || n.is_power_of_two() {
+                        let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+                        tracing::warn!(
+                            frame,
+                            queued_at_the_last_pass = slots,
+                            due_at_the_last_pass = due,
+                            draws_so = n,
+                            "a bake draw gets no texture pass: the frame's bakes have used their time (VICTORY_BAKE_TEXTURES_MS)"
+                        );
+                    }
+                }
                 let run_pass = left > 0
                     && (first
                         || !exact
@@ -2575,6 +2589,18 @@ impl State {
             crate::texture::BAKING.set(false);
             let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
             if left == 0 {
+                static SPENT_OUT: AtomicU64 = AtomicU64::new(0);
+                let n = SPENT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 64 || n.is_power_of_two() {
+                    let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    tracing::warn!(
+                        frame,
+                        queued_at_the_last_pass = slots,
+                        due_at_the_last_pass = due,
+                        draws_so = n,
+                        "a bake draw gets no texture pass: the frame's bakes have used their time (VICTORY_BAKE_TEXTURES_MS)"
+                    );
+                }
                 return;
             }
             if !first && exact {
@@ -2851,10 +2877,15 @@ impl State {
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
+        let all = due.len();
+        let uploaded_before = HEAP_TEXTURES.load(Ordering::Relaxed);
+        let mut left = (0usize, "");
         let mut served = true;
-        for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+        for (at, (index, write)) in due.into_iter().enumerate() {
+            let out_of_bytes = SPENT.load(Ordering::Relaxed) >= bytes_at_most;
+            if out_of_bytes || began.elapsed() > span {
                 served = false;
+                left = (all - at, if out_of_bytes { "bytes" } else { "time" });
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -3249,6 +3280,23 @@ impl State {
         }
         if sync.is_none() && baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
+        }
+        if baking && (!served || refused > 0) {
+            static LEFT: AtomicU64 = AtomicU64::new(0);
+            let n = LEFT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 64 || n.is_power_of_two() {
+                tracing::warn!(
+                    frame,
+                    due = all,
+                    not_reached = left.0,
+                    ended_by = left.1,
+                    refused_for_room = refused,
+                    uploaded = HEAP_TEXTURES.load(Ordering::Relaxed).saturating_sub(uploaded_before),
+                    ms = began.elapsed().as_millis() as u64,
+                    passes_so = n,
+                    "the pass ahead of a bake draw left due textures as they were: the bake may sample what is not on the card"
+                );
+            }
         }
         served
     }

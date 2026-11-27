@@ -56,6 +56,7 @@ $settings = @{
     VICTORY_AMBIENT_AIR       = '1.5'
     VICTORY_AMBIENT_MOST      = '2'
     VICTORY_AMBIENT_SETTLE    = '250,3'
+    VICTORY_AMBIENT_FLOOR     = '0.04'
     VICTORY_NAN_SCRUB         = '1'
     VICTORY_RENDER_SCALE      = $scale
     VICTORY_UPSCALER          = '6'
@@ -75,6 +76,10 @@ $settings = @{
     VICTORY_LEVELS_RECLAIM    = '1'
     VICTORY_READBACK_POOL     = '1'
     VICTORY_READBACK_POOL_MB  = '64'
+    VICTORY_LAND_SKIP         = '1'
+    VICTORY_TEXBACK_ASYNC     = '1'
+    VICTORY_FRESH_OPEN        = '1'
+    VICTORY_PRELUDE_POOL      = '1'
     VICTORY_PORT_GUARD        = '1'
     VICTORY_PORT_JOURNAL      = '1'
     VICTORY_PORT_CONSTANTS    = '1'
@@ -92,6 +97,12 @@ if ($Preset -eq 'quality-720p' -or $Preset -eq 'native-1080p') {
     $settings.VICTORY_AMBIENT_SHADE = '1.2,0.85'
 }
 
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$rtList = Join-Path $repoRoot 'scripts\rt_off_hashes.txt'
+if (-not $RayTracing -and (Test-Path $rtList)) {
+    $settings.VICTORY_SKIP_PIPELINES_FILE = $rtList
+}
+
 if ($RayTracing) {
     $settings.VICTORY_BVH_BUILDER = '1'
     $settings.VICTORY_FIRSTLANE_OWN = '1'
@@ -99,7 +110,7 @@ if ($RayTracing) {
     $settings.VICTORY_BVH_FAULTS_ALL = '8192'
     $settings.VICTORY_AMBIENT_RT = '0.5,2.0,0.8'
     $settings.VICTORY_CARD_BUFFERS_MB = '512'
-    foreach ($off in 'VICTORY_BVH_MISS', 'VICTORY_RT_NO_ARENAS', 'VICTORY_AMBIENT', 'VICTORY_AMBIENT_AIR', 'VICTORY_AMBIENT_MOST', 'VICTORY_AMBIENT_SHADE', 'VICTORY_TEXTURE_MIP_DROP') {
+    foreach ($off in 'VICTORY_BVH_MISS', 'VICTORY_RT_NO_ARENAS', 'VICTORY_AMBIENT', 'VICTORY_AMBIENT_AIR', 'VICTORY_AMBIENT_MOST', 'VICTORY_AMBIENT_SHADE', 'VICTORY_AMBIENT_FLOOR', 'VICTORY_TEXTURE_MIP_DROP') {
         $settings.Remove($off)
     }
 }
@@ -116,7 +127,6 @@ if ($SkipBink) { $settings.VICTORY_SKIP_BINK = '1' }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'target' }
 $victory = Join-Path $targetRoot "$Build\victory.exe"
 if (-not (Test-Path $victory)) {
