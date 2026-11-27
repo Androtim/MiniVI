@@ -32,7 +32,7 @@ MiniVI's `PE loader` maps console `PE32+` binaries directly into the host Window
 ### 2. High-Level Emulation: `kernelx`, `XGameRuntime`, & `Bink` (`victory-hle`)
 The `HLE` layer bridges GDK operating-system expectations to native Win32 APIs:
 - **`kernelx` Memory & Sync:** Emulates 32-bit constrained allocations, 64 KiB placeholder reservations (`XMemVirtualAlloc` / `VirtualAlloc2`), physical page mapping, events, semaphores, and worker thread pools (`VICTORY_HELPER_PRIORITY`).
-- **`XGameRuntime` (`xgameruntime`) & Input:** Provides asynchronous task queues, user/storage stubs, and low-latency HID/GameInput translation.
+- **`XGameRuntime` (`xgameruntime`) & Input:** Provides asynchronous task queues, user/storage stubs, and low-latency HID/GameInput translation with focused-window mouse camera support (`VICTORY_GAMEPAD_MOUSE=0` to disable).
 - **Media (`Bink`):** Intercepts `Bink` video playback entry points and optionally fast-skips blocking intro cinematics (`VICTORY_SKIP_BINK=1|all`).
 
 ### 3. `RDNA2` -> `DXIL` Recompiler & `HLSL` Host Passes (`victory-shader`, `victory-gpu`)
@@ -45,7 +45,7 @@ Hardware shaders compiled for console `RDNA2` wavefronts are statically lowered 
 Translating `d3d12_xs` into desktop `D3D12` on an 8 GB GPU requires avoiding PCIe stalls and out-of-budget committed allocations:
 - **Reserved `tiling` & Swizzle Conversion:** Intercepts `CreateReservedResource` cleanly outside the committed pool so thousands of 2D mipmapped textures stream individual tiles (`VICTORY_LEVELS_ALL=1`, `VICTORY_LEVELS_MAX_DIM`, `VICTORY_LEVELS_RECLAIM=1`), with console texture `swizzle` layout conversion handled inside `victory-formats` alongside `BCPack` decoding.
 - **Descriptors, Commands, & Async Pipelines:** Manages bindless `descriptor` heaps (`1,000,000` view clamp with `HostHeap` ID checks), `command list` pool trimming under host RAM pressure (`VICTORY_LIST_POOL_MOST`), multi-worker `pipeline` compilation, and deferred pipeline library stores (`VICTORY_LIBRARY_STORE_LATER=1`).
-- **`DirectStorage` & No-RT Speedups:** Enforces a configurable `DirectStorage` staging floor (`VICTORY_DSTORAGE_STAGING_MB`), skips redundant ray-skinning and `_BVH` ray-trace compute passes when `VICTORY_BVH_MISS=1`, provides a zero-VRAM No-RT fast path (`VICTORY_RT_NO_ARENAS=1`), and enables `VICTORY_PORT_CONSTANTS=1` / `VICTORY_PORT_GUARD=1` / `VICTORY_PORT_JOURNAL=1` low-overhead host buffer tracking.
+- **`DirectStorage` & No-RT Speedups:** Enforces a configurable `DirectStorage` staging floor (`VICTORY_DSTORAGE_STAGING_MB`), skips redundant ray-skinning and `_BVH` ray-trace compute passes when `VICTORY_BVH_MISS=1`, provides a zero-VRAM No-RT fast path (`VICTORY_RT_NO_ARENAS=1`), and enables `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`, and `VICTORY_HEAP_RECHECK=0` (-15 ms/frame prepare overhead) for fast host buffer tracking.
 
 ---
 
@@ -53,7 +53,7 @@ Translating `d3d12_xs` into desktop `D3D12` on an 8 GB GPU requires avoiding PCI
 
 - **Multi-GPU & Multi-OS Support:** Runs on NVIDIA GeForce (RTX 4060 Ti 8 GB reference target) and AMD Radeon (`-Amd` toggle), Windows 11, Windows 10 (`--features agility-sdk` via `scripts\get-agility-sdk.ps1`), and Wine/Proton.
 - **VRAM-Scaled Memory Budgeting:** Scales render-target headroom (`<= budget / 4`), texture pools, RT card arenas (`VICTORY_MEMORY_CARD_MB`), address-indexed BVH arenas (`VICTORY_RT_MEMORY_MB`), readback pools (`VICTORY_READBACK_POOL=1`), and host snapshot pools automatically for `<= 9 GiB` GPUs.
-- **Visual & Stability Hardening:** Universal `F3` FPS/VRAM telemetry overlay (`diag` and `release`), 32-lane tiled water-light auto-skip (`VICTORY_WATER_LIGHT=1`), out-of-memory texture retries, BC7 mode rotation fix, linear-sRGB Series S plane composition, and big-compare slice underflow protection.
+- **Visual & Stability Hardening:** Universal `F3` FPS/VRAM telemetry overlay (`diag` and `release`), 32-lane tiled water-light auto-skip (`VICTORY_WATER_LIGHT=1`), out-of-memory texture retries, BC7 mode rotation fix, linear-sRGB Series S plane composition, big-compare slice underflow protection, and clean `ID3D12CommandQueue` suspend/resume (`0xb8`/`0xc0`) shutdown handling.
 
 ---
 

@@ -1221,10 +1221,14 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
     }
 }
 
+extern "system" fn suspend_resume(_: This) -> HRESULT {
+    S_OK
+}
+
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -1235,6 +1239,8 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (21, suspend_resume as *const ()),       // 0xa8 -> 0xb8 suspend
+    (22, suspend_resume as *const ()),       // 0xb0 -> 0xc0 resume
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
@@ -1337,6 +1343,19 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    #[test]
+    fn suspend_and_resume_return_ok_on_shutdown() {
+        let (old, new) = (queue_table(false), queue_table(true));
+        for &(table, s0, s1) in &[(&old, 0xa8, 0xb0), (&new, 0xb8, 0xc0)] {
+            assert_eq!(table[s0 / 8], suspend_resume as *const ());
+            assert_eq!(table[s1 / 8], suspend_resume as *const ());
+            let f0: extern "system" fn(This) -> HRESULT = unsafe { std::mem::transmute(table[s0 / 8]) };
+            let f1: extern "system" fn(This) -> HRESULT = unsafe { std::mem::transmute(table[s1 / 8]) };
+            assert_eq!(f0(std::ptr::null()), S_OK);
+            assert_eq!(f1(std::ptr::null()), S_OK);
+        }
     }
 
     #[test]

@@ -79,6 +79,7 @@ $settings = @{
     VICTORY_PORT_JOURNAL      = '1'
     VICTORY_PORT_CONSTANTS    = '1'
     VICTORY_PORT_CBV          = '0'
+    VICTORY_HEAP_RECHECK      = '0'
     VICTORY_RT_NO_ARENAS      = '1'
     VICTORY_LIBRARY_STORE_LATER = '1'
     VICTORY_PIPELINE_WAIT_MS  = '150'
