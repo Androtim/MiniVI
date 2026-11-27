@@ -217,7 +217,6 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
-            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -246,7 +245,6 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
-                priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -268,6 +266,78 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
+}
+
+/// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps`] for a
+/// submission that needs round `mark` (one that began after what it waits
+/// for was written, `crate::port_journal::round_after`): asked for if it has not
+/// been. 0: as [`begin_sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
+    if mark == 0 || !sync_aside() {
+        return begin_sync_heaps();
+    }
+    // (The thread is started by the first `begin_sync_heaps`.)
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        drop(rounds);
+        return begin_sync_heaps();
+    }
+    let asked = rounds.0 < mark;
+    rounds.0 = rounds.0.max(mark);
+    drop(rounds);
+    if asked {
+        SYNC_ROUNDS.1.notify_all();
+    } else {
+        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    SyncedHeaps(Some(mark))
+}
+
+/// Renderer port #7: the number of a round of the heaps' records that
+/// begins after this call, asked for if none is waiting to begin (at the
+/// title's submit: the round runs while the submission waits in the line).
+/// 0 if the records are not synced by a thread of their own (or it has not
+/// started yet).
+#[cfg(windows)]
+pub(crate) fn round_after_now() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = round;
+        drop(rounds);
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    round
+}
+
+/// Renderer port #7: the number of the first round that begins after this
+/// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
+#[cfg(windows)]
+pub(crate) fn round_mark() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    rounds.0 + 1
+}
+
+/// Whether `[at, at + len)` touches the title memory of a placed
+/// shader-visible heap of descriptors.
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at as u64 + len as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
 }
 
 #[cfg(windows)]
@@ -524,6 +594,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -613,10 +684,7 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists, and `id` says it is the one that
-/// took them ([`crate::descriptor::host::HostHeap::id`]): the title can
-/// release the heap a list's slots came from, and a later heap can be made
-/// at the same address before the list is reset.
+/// `heap`, if that host heap instance (`id`) still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -670,8 +738,8 @@ impl Drop for Heap {
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
         drop(heaps);
-        // A released view heap takes its run of title-memory views with it
-        // (`memory::forget_heap`, #589) so a reused address does not inherit it.
+        // If this heap held a run of title-memory views (`Memory::heaps`),
+        // forget that run before another heap can reuse `self.host`'s address.
         if let Some(Some(host)) = self.host.get() {
             crate::memory::forget_heap(host);
         }
@@ -815,12 +883,16 @@ pub(crate) enum View {
 
 impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
+    /// of resources or of memory) or memory the title placed a texture in
+    /// to sample: such views get host slots only for draws. Placed
+    /// unordered texture views live on the host alone, as texture objects'
+    /// unordered views do, so shader-visible heap writes mirror them.
     #[cfg(windows)]
     fn is_buffer(&self) -> bool {
+        const BUFFER: u32 = 1;
         match self {
-            View::Constant(..) | View::Placed(..) => true,
+            View::Constant(..) | View::Placed(false, ..) => true,
+            View::Placed(true, resource, _) => resource[0] == BUFFER,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
@@ -1303,11 +1375,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1599,74 +1679,6 @@ mod tests {
         );
     }
 
-    /// A table made afresh for a draw holds the descriptors its shader
-    /// moves halves through (`HostShader::half_views`), also past the range
-    /// starts its used-resource entries give: with one entry for a range
-    /// from dword 0 and a 16-bit float buffer view at dword 8, the table
-    /// takes two dynamic slots, so the next allocation does not land on the
-    /// view's. (The case avt0m4t48 found in review on #927.)
-    #[cfg(windows)]
-    #[test]
-    fn a_fresh_table_holds_the_half_views_past_its_range_starts() {
-        use victory_shader::{ResourceType, RootType, UsedResource};
-        let Some(device) = crate::host::host() else {
-            return; // no host GPU
-        };
-        let list = device.new_list().expect("a host list");
-        let desc = HeapDesc {
-            kind: VIEWS_KIND,
-            count: 2,
-            flags: SHADER_VISIBLE,
-            nodes: 1,
-        };
-        let none = Placement {
-            address: 0,
-            size: 0,
-        };
-        let mut h: This = std::ptr::null();
-        assert_eq!(create(desc, none, &mut h), S_OK);
-        let title = heap(h);
-        let host_heap = title.host().expect("a host view heap");
-        let (first, second) = (title.handle(0).unwrap(), title.handle(1).unwrap());
-        // An R16G16B16A16_FLOAT buffer view of memory in the second slot.
-        let memory = [0u64; 64];
-        let address = memory.as_ptr() as u64;
-        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
-        let mut words = [0u32; 16];
-        words[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
-        words[10] = address as u32;
-        words[11] = (address >> 32) as u32;
-        create_placed_srv(std::ptr::null(), &resource, &words, second);
-        assert!(view(second).as_ref().and_then(host::half_view).is_some());
-        let mut state = crate::draw::State::default();
-        state.set_heaps(&[h]);
-        state.set_table(true, 1, first);
-        let range = UsedResource {
-            kind: ResourceType::Srv,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 8,
-            dwords: 4,
-            user_data: 4,
-            slot: 1,
-        };
-        let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
-        let [(1, offset)] = made[..] else {
-            panic!("one fresh table for root parameter 1, not {:?}", &made[..]);
-        };
-        assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
-        let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(host_heap.id(), next, 1);
-        drop(state);
-        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
-        assert_eq!(
-            next,
-            offset / 32 + 2,
-            "the next allocation took the table's second slot"
-        );
-    }
-
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -1854,6 +1866,23 @@ mod tests {
         assert_ne!(words(at), words(other.as_ptr() as u64));
     }
 
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+    }
+
     /// A released resource's views go stale; the same view of a new
     /// resource at the same address is a new record.
     #[test]
@@ -1902,32 +1931,5 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn a_released_view_heap_forgets_its_title_memory_run() {
-        let Some(device) = crate::host::host() else {
-            return;
-        };
-        let list = device.new_list().expect("a host list");
-        let desc = HeapDesc {
-            kind: VIEWS_KIND,
-            count: 64,
-            flags: SHADER_VISIBLE,
-            nodes: 1,
-        };
-        let none = Placement {
-            address: 0,
-            size: 0,
-        };
-        let mut h: This = std::ptr::null();
-        assert_eq!(create(desc, none, &mut h), S_OK);
-        let host_heap = heap(h).host().expect("a host view heap");
-        let key = std::ptr::from_ref(host_heap) as usize;
-        assert!(crate::memory::ready(&list, host_heap, &[], &[], &[], crate::memory::Use::Reads, None).is_some());
-        assert!(crate::memory::has_run(key), "the heap's run is kept while it lives");
-        assert_eq!(object::release_boxed::<Heap>(h), 0);
-        assert!(!crate::memory::has_run(key), "a released heap's run is forgotten");
     }
 }

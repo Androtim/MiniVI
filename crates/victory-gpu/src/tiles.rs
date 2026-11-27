@@ -836,7 +836,7 @@ impl Drop for Tiled {
 
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
-/// it started before it, shows as many levels fewer (clamped to the
+/// it started before it, and shows as many levels fewer (clamped to the
 /// remaining levels). `ResourceMinLODClamp` is measured from mip 0 of the
 /// resource, so moving the start of the view preserves that field.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {

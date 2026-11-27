@@ -765,9 +765,6 @@ impl Memory {
             }
         }
         self.stats.faults += pages.len() as u64;
-        // The first frames that leave pages without a copy: all of them, and
-        // which of them hold a packed structure's first bytes or lie in a
-        // title buffer (to tell walked structures from stray pointers).
         static WHOLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if made < pages.len()
             && self.faulted >= all
@@ -1038,9 +1035,7 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    let spare = spare_pages();
-    let most = most_pages();
-    while builds && m.free.len() < spare && m.pages.len() + m.free.len() < most && m.another() {}
+    while builds && m.free.len() < spare_pages() && m.pages.len() + m.free.len() < most_pages() && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1177,12 +1172,12 @@ pub(crate) fn ready(
         m.dump.walked(addresses);
     }
     let directory = &m.directory.1;
-    Some(Ready {
-        directory: directory.gpu(directory.span().0),
-        faults: m.faults.2,
-        base,
-    })
-}
+        Some(Ready {
+            directory: directory.gpu(directory.span().0),
+            faults: m.faults.2,
+            base,
+        })
+    }
 
 /// Forgets the run of title-memory views kept for host view heap `heap`
 /// (`Memory::heaps`, by address), when the title releases its heap.
@@ -1197,7 +1192,11 @@ pub(crate) fn forget_heap(heap: &HostHeap) {
 /// address `key` (tests).
 #[cfg(test)]
 pub(crate) fn has_run(key: usize) -> bool {
-    MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.heaps.contains_key(&key))
+    MEMORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|m| m.heaps.contains_key(&key))
 }
 
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of

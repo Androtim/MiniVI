@@ -1,12 +1,14 @@
-# Portable MiniVI launcher for 8 GB VRAM / 16-32 GB RAM systems (Series S profile).
+# Portable MiniVI launcher for 8 GB VRAM / 16-32 GB RAM systems (Series S / X profile).
 # Supply -Exe or set $env:VICTORY_GAME_DIR before launching.
 param(
     [string]$Exe,
     [ValidateSet('perf-540p', 'balanced-720p', 'quality-720p', 'native-1080p')][string]$Preset = 'balanced-720p',
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
     [switch]$NoSmoothMotion,
     [switch]$RayTracing,
     [switch]$Amd,
+    [switch]$SkipBink,
     [string]$Adapter,
     [hashtable]$More = @{}
 )
@@ -32,13 +34,10 @@ $maxDim = switch ($Preset) {
     'quality-720p'  { '2048' }
     'native-1080p'  { '2048' }
 }
-$bakeMb = if ($Preset -eq 'perf-540p') { '128' } else { '512' }
 
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT   = '1'
-    VICTORY_RELAY             = '1'
-    VICTORY_RELAY_FLUSH_TABLES = '1'
-    VICTORY_SKIP_WC_BACK      = '1'
+    VICTORY_RELAY             = '2'
     VICTORY_CARD_STEPS        = '2'
     VICTORY_WIDE_BACK         = '1'
     VICTORY_CARD_REHASH_RUNS  = '1'
@@ -50,47 +49,47 @@ $settings = @{
     VICTORY_TITLE_PRIORITIES  = '0'
     VICTORY_CARD_AWAKE        = '1'
     VICTORY_SHOW_AFTER        = '1'
-    VICTORY_THIN              = '1'
-    VICTORY_JOIN_PARTS        = '8'
+    VICTORY_THIN              = '0'
+    VICTORY_JOIN_PARTS        = '0'
     VICTORY_UPLOAD_AHEAD      = '1'
     VICTORY_AMBIENT           = '1.4'
     VICTORY_AMBIENT_AIR       = '1.5'
     VICTORY_AMBIENT_MOST      = '2'
+    VICTORY_AMBIENT_SETTLE    = '250,3'
     VICTORY_NAN_SCRUB         = '1'
-    VICTORY_NO_WATCHDOG       = '1'
-    VICTORY_COMPOSE           = '1'
     VICTORY_RENDER_SCALE      = $scale
-    VICTORY_OWN_UPSCALER      = '1'
+    VICTORY_UPSCALER          = '6'
     VICTORY_BVH_MISS          = '1'
     VICTORY_DYNAMIC_SLOTS     = '524288'
-    VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
     VICTORY_CARD_BUFFERS_MB   = '1024'
     VICTORY_CARD_WINDOWS_MB   = '256'
     VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
     VICTORY_TEXTURE_ROOM_PERCENT = '92'
     VICTORY_DSTORAGE_STAGING_MB = '64'
     VICTORY_EARLY_TEXTURES_MS = '35'
+    VICTORY_BAKE_TEXTURES_MS  = '1500'
     VICTORY_LEVELS_ON_DEMAND  = '1'
     VICTORY_LEVELS_ALL        = '1'
     VICTORY_LEVELS_MAX_DIM    = $maxDim
     VICTORY_LEVELS_RECLAIM    = '1'
-    VICTORY_RESIDENCY         = '1'
     VICTORY_READBACK_POOL     = '1'
     VICTORY_READBACK_POOL_MB  = '64'
-    VICTORY_BAKE_SOURCES_MB   = $bakeMb
+    VICTORY_PORT_GUARD        = '1'
+    VICTORY_PORT_JOURNAL      = '1'
+    VICTORY_PORT_CONSTANTS    = '0'
+    VICTORY_PORT_CBV          = '0'
+    VICTORY_LIBRARY_STORE_LATER = '1'
     VICTORY_PIPELINE_WAIT_MS  = '150'
     VICTORY_PIPELINE_WORKERS  = '6'
     VICTORY_PIPELINE_LOWEST   = '1'
     VICTORY_D3D12_DRED        = 'light'
-    VICTORY_SKIP_PIPELINES    = 'none'
 }
 
 if ($Preset -eq 'quality-720p' -or $Preset -eq 'native-1080p') {
-    $settings.VICTORY_AMBIENT_SHADE   = '1.2,0.85'
-    $settings.VICTORY_AMBIENT_REFLECT = '0.65'
+    $settings.VICTORY_AMBIENT_SHADE = '1.2,0.85'
 }
 
-$rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
 if ($RayTracing) {
     $settings.VICTORY_BVH_BUILDER = '1'
     $settings.VICTORY_FIRSTLANE_OWN = '1'
@@ -98,18 +97,20 @@ if ($RayTracing) {
     $settings.VICTORY_BVH_FAULTS_ALL = '8192'
     $settings.VICTORY_AMBIENT_RT = '0.5,2.0,0.8'
     $settings.VICTORY_CARD_BUFFERS_MB = '512'
-    $settings.VICTORY_SKIP_PIPELINES = 'none'
-    foreach ($off in 'VICTORY_BVH_MISS', 'VICTORY_AMBIENT', 'VICTORY_AMBIENT_AIR', 'VICTORY_AMBIENT_MOST', 'VICTORY_AMBIENT_SHADE', 'VICTORY_AMBIENT_REFLECT', 'VICTORY_TEXTURE_MIP_DROP') {
+    foreach ($off in 'VICTORY_BVH_MISS', 'VICTORY_AMBIENT', 'VICTORY_AMBIENT_AIR', 'VICTORY_AMBIENT_MOST', 'VICTORY_AMBIENT_SHADE', 'VICTORY_TEXTURE_MIP_DROP') {
         $settings.Remove($off)
     }
-} elseif (Test-Path $rtList) {
-    $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
 }
 if ($Amd) {
-    foreach ($off in 'VICTORY_RELAY', 'VICTORY_RELAY_COPY', 'VICTORY_RELAY_FLUSH_TABLES') {
+    foreach ($off in 'VICTORY_RELAY', 'VICTORY_RELAY_COPY') {
         $settings.Remove($off)
     }
+    $settings.VICTORY_THIN = '1'
+    $settings.VICTORY_JOIN_PARTS = '8'
+    $settings.VICTORY_PORT_CONSTANTS = '1'
+    $settings.VICTORY_PORT_CBV = '1'
 }
+if ($SkipBink) { $settings.VICTORY_SKIP_BINK = '1' }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
@@ -134,6 +135,6 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $keep } | ForEach-Ob
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
 $Exe = (Resolve-Path $Exe).Path
-Write-Host "MiniVI ($Preset, max mip ${maxDim}px, render scale $scale)"
+Write-Host "MiniVI ($Preset, $Console, max mip ${maxDim}px, render scale $scale)"
 Push-Location $repoRoot
-try { & $victory run $Exe --execute --console series-s } finally { Pop-Location }
+try { & $victory run $Exe --execute --console $Console } finally { Pop-Location }

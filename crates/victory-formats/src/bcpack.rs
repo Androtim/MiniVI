@@ -1409,14 +1409,14 @@ mod tests {
             let ctrl = (1 << 6) | (1 << 3) | mode;
             let t = tables_for(ctrl);
             let mut s = vec![0u8; 32];
-            s[4] = zigzag(0x21);
-            s[5] = zigzag(0x12);
-            s[6] = zigzag(0x05);
-            s[7] = zigzag(0x06);
-            s[8] = zigzag(0x09);
-            s[9] = zigzag(0x0a);
-            s[10] = zigzag(0x0d);
-            s[11] = zigzag(0x0e);
+            s[4] = zigzag(0x21); // stored R0 (holds alpha precision after rot=1)
+            s[5] = zigzag(0x12); // stored R1
+            s[6] = zigzag(0x05); // stored G0
+            s[7] = zigzag(0x06); // stored G1
+            s[8] = zigzag(0x09); // stored B0
+            s[9] = zigzag(0x0a); // stored B1
+            s[10] = zigzag(0x0d); // stored A0 (holds color precision after rot=1)
+            s[11] = zigzag(0x0e); // stored A1
             let src = stream(&t, &BC7_WIDTHS, 2, &[s]);
             let mut dst = [0u8; 16];
             decode(7, &src, &mut dst, &t).unwrap();
@@ -1425,10 +1425,11 @@ mod tests {
             let alpha_bits = u32::from(base_bits[3]);
             let mut w = Bits::default();
             w.put(1 << mode, u32::from(mode) + 1);
-            w.put(1, 2);
+            w.put(1, 2); // rotation = 1
             if mode == 4 {
-                w.put(0, 1);
+                w.put(0, 1); // indexSelectionBit = 0
             }
+            // Endpoint order after rot=1 swaps indices 3 and 0: [3 (R), 1 (G), 2 (B), 0 (A)].
             for (v, n) in [
                 (0x0d, color_bits),
                 (0x0e, color_bits),

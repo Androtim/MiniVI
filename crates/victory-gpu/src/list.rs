@@ -204,15 +204,17 @@ impl Detached {
         &self.host
     }
 
-    pub(crate) fn tables_done(&mut self) {
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` allocator delay.
+    pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
 }
 
-/// A host list that has run and waits to be used again, the bytes of
-/// upload memory it keeps, and the `now_ms()` timestamp when it was parked.
+/// A host list that has run and waits to be used again, and the bytes of
+/// upload memory it keeps.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64, u64);
+struct Idle(crate::host::HostList, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -227,58 +229,91 @@ unsafe impl Send for Idle {}
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+static IDLE: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool {
+    lists: Vec::new(),
+    bytes: 0,
+    low: 0,
+    since_ms: 0,
+});
+
+/// The idle host lists, the upload memory they keep between them, and the
+/// fewest there were since `since_ms`: as many as none took in that time,
+/// which [`recycle`] may let go.
+#[cfg(windows)]
+struct Pool {
+    lists: Vec<Idle>,
+    bytes: u64,
+    low: usize,
+    since_ms: u64,
+}
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
 /// their preludes and buffers, 12 % of the submitting thread in the opening,
-/// profile cpu-1), and the most upload memory they may keep
-/// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// profile cpu-1). `VICTORY_LIST_IDLE_MOST=N` (or `VICTORY_LIST_POOL_MOST=N`):
+/// N instead of 512, from 16 to 4096.
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
-
-/// Maximum idle host command lists kept for reuse, defaulting to `512` or
-/// overridden via `VICTORY_LIST_POOL_MOST` (`16..=1024`). Under host RAM
-/// pressure, [`trim_idle_lists`] prunes excess entries down to 64.
-#[cfg(windows)]
-fn idle_list_most_for(_limited_ram: bool, override_count: Option<usize>) -> usize {
-    if let Some(count) = override_count {
-        return count.clamp(16, 1024);
-    }
-    IDLE_MOST.0
-}
-
-/// Optional idle expiry TTL in milliseconds (`VICTORY_LIST_POOL_IDLE_S`, `0`
-/// or unset disables TTL; capped at 600 s).
-#[cfg(windows)]
-fn idle_list_ttl_ms_for(_limited_ram: bool, override_s: Option<u64>) -> Option<u64> {
-    match override_s {
-        Some(0) | None => None,
-        Some(s) => Some(s.min(600) * 1000),
-    }
-}
-
-#[cfg(windows)]
-fn idle_list_most() -> usize {
-    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let ov = *OVERRIDE.get_or_init(|| {
-        std::env::var("VICTORY_LIST_POOL_MOST")
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let set = std::env::var("VICTORY_LIST_IDLE_MOST")
             .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-    });
-    idle_list_most_for(crate::residency::limited_host_ram(), ov)
+            .or_else(|| std::env::var("VICTORY_LIST_POOL_MOST").ok())
+            .and_then(|v| v.trim().parse().ok());
+        set.map_or(512, |n: usize| n.clamp(16, 4096))
+    })
 }
 
+/// Immediately drops excess idle host lists down to 64 under host RAM pressure.
 #[cfg(windows)]
-fn idle_list_ttl_ms() -> Option<u64> {
-    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let ov = *OVERRIDE.get_or_init(|| {
-        std::env::var("VICTORY_LIST_POOL_IDLE_S")
+pub(crate) fn trim_on_pressure() {
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let excess = idle.lists.len().saturating_sub(64);
+        if excess > 0 {
+            dropped = idle.lists.drain(..excess).collect();
+            idle.bytes -= dropped.iter().map(|Idle(_, b)| b).sum::<u64>();
+            idle.low = idle.low.min(idle.lists.len());
+        }
+    }
+    drop(dropped);
+}
+
+/// The most upload memory idle host lists may keep between them (a list
+/// keeps scratch chunks over a reset only while lists do not share them,
+/// `VICTORY_SCRATCH_POOL=0`).
+#[cfg(windows)]
+const IDLE_BYTES: u64 = 256 << 20;
+
+/// How long idle host lists none took may stay before some are let go, in
+/// milliseconds (0, by default: they stay, as before;
+/// `VICTORY_LIST_IDLE_TRIM_S=N`, N seconds, 10 to try). A D3D12 allocator
+/// keeps its memory over a reset, so an idle list keeps the most its
+/// commands ever took.
+#[cfg(windows)]
+fn trim_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let set = std::env::var("VICTORY_LIST_IDLE_TRIM_S")
             .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    });
-    idle_list_ttl_ms_for(crate::residency::limited_host_ram(), ov)
+            .and_then(|v| v.trim().parse().ok());
+        set.map_or(0, |s: u64| s.saturating_mul(1000))
+    })
+}
+
+/// Idle host lists a trim always leaves.
+#[cfg(any(windows, test))]
+const TRIM_FLOOR: usize = 16;
+/// The most idle host lists one trim lets go.
+#[cfg(any(windows, test))]
+const TRIM_PER_TICK: usize = 32;
+
+/// How many idle host lists a trim lets go when `low` of them were never
+/// taken in its window: those above `floor`, `per_tick` at most.
+#[cfg(any(windows, test))]
+fn trim_count(low: usize, floor: usize, per_tick: usize) -> usize {
+    low.saturating_sub(floor).min(per_tick)
 }
 
 /// Whether host lists that have run are used again (on by default;
@@ -295,42 +330,17 @@ fn pools() -> bool {
 fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes, _)) = &taken {
-            idle.1 -= bytes;
+        let taken = idle.lists.pop();
+        if let Some(Idle(_, bytes)) = &taken {
+            idle.bytes -= bytes;
         }
+        idle.low = idle.low.min(idle.lists.len());
         taken
     };
     match idle {
-        Some(Idle(list, _, _)) => Some(list),
+        Some(Idle(list, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
-}
-
-/// Releases aged or excess idle command lists outside the pool mutex so D3D12
-/// allocator teardown never stalls active list recording.
-#[cfg(windows)]
-pub(crate) fn trim_idle_lists(now_ms: u64, pressured: bool) {
-    let ttl = idle_list_ttl_ms();
-    if !pressured && ttl.is_none() {
-        return;
-    }
-    let min_keep = if pressured { 64 } else { 32 };
-    let mut dropped = Vec::new();
-    {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        while idle.0.len() > min_keep {
-            let expired = ttl.is_some_and(|ms| now_ms.saturating_sub(idle.0[0].2) >= ms);
-            if pressured || expired {
-                let removed = idle.0.remove(0);
-                idle.1 = idle.1.saturating_sub(removed.1);
-                dropped.push(removed);
-            } else {
-                break;
-            }
-        }
-    }
-    drop(dropped);
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -342,13 +352,11 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    let most = idle_list_most();
-    let now_ms = crate::host::now_ms();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len() >= idle_most() {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -356,11 +364,31 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes, now_ms));
-            idle.1 += bytes;
+        if idle.lists.len() < idle_most() && idle.bytes + bytes <= IDLE_BYTES {
+            idle.lists.push(Idle(host, bytes));
+            idle.bytes += bytes;
         }
     }
+    let window = trim_ms();
+    if window == 0 {
+        return;
+    }
+    // What none took in the window goes, the longest idle first (the bottom
+    // of the stack), dropped out of the lock as a full pool drops a list.
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::host::now_ms();
+        if now.saturating_sub(idle.since_ms) < window {
+            return;
+        }
+        let n = trim_count(idle.low, TRIM_FLOOR, TRIM_PER_TICK);
+        let gone: Vec<Idle> = idle.lists.drain(..n).collect();
+        idle.bytes -= gone.iter().map(|Idle(_, b)| b).sum::<u64>();
+        idle.low = idle.lists.len();
+        idle.since_ms = now;
+        gone
+    };
+    drop(gone);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2453,6 +2481,41 @@ mod tests {
     use crate::object::slot;
 
     #[test]
+    fn trim_count_keeps_the_floor_and_the_step() {
+        assert_eq!(trim_count(0, TRIM_FLOOR, TRIM_PER_TICK), 0);
+        assert_eq!(trim_count(TRIM_FLOOR, TRIM_FLOOR, TRIM_PER_TICK), 0);
+        assert_eq!(trim_count(TRIM_FLOOR + 5, TRIM_FLOOR, TRIM_PER_TICK), 5);
+        assert_eq!(trim_count(4096, TRIM_FLOOR, TRIM_PER_TICK), TRIM_PER_TICK);
+    }
+
+    /// The low-water mark as `fresh_list` and `recycle` keep it, on plain
+    /// numbers: the bytes of each idle list, their total, and the fewest
+    /// there were since the last trim.
+    #[test]
+    fn a_trim_lets_go_what_none_took() {
+        let mut lists: Vec<u64> = (0..100).collect();
+        let mut bytes: u64 = lists.iter().sum();
+        let mut low = lists.len();
+        // A push never raises it.
+        lists.push(7);
+        bytes += 7;
+        assert_eq!(low, 100);
+        // A window with no pops: all but the floor were idle, a step at most.
+        let n = trim_count(low, TRIM_FLOOR, TRIM_PER_TICK);
+        assert_eq!(n, (100 - TRIM_FLOOR).min(TRIM_PER_TICK));
+        let gone: Vec<u64> = lists.drain(..n).collect();
+        bytes -= gone.iter().sum::<u64>();
+        low = lists.len();
+        // The longest idle went, and the total is what is left.
+        assert_eq!(gone[0], 0);
+        assert_eq!(bytes, lists.iter().sum::<u64>());
+        // A pop lowers it.
+        lists.pop();
+        low = low.min(lists.len());
+        assert_eq!(low, lists.len());
+    }
+
+    #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
         let mut allocator = null;
@@ -2518,27 +2581,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn idle_list_bounds_scale_for_limited_ram_and_overrides() {
-        assert_eq!(idle_list_most_for(false, None), 512);
-        assert_eq!(idle_list_most_for(true, None), 512);
-        assert_eq!(idle_list_most_for(true, Some(4)), 16);
-        assert_eq!(idle_list_most_for(false, Some(4096)), 1024);
-        assert_eq!(idle_list_ttl_ms_for(false, None), None);
-        assert_eq!(idle_list_ttl_ms_for(true, None), None);
-        assert_eq!(idle_list_ttl_ms_for(true, Some(0)), None);
-        assert_eq!(idle_list_ttl_ms_for(false, Some(30)), Some(30_000));
-        assert_eq!(idle_list_ttl_ms_for(false, Some(1200)), Some(600_000));
-    }
-
+    /// A back-copied texture written, whose memory the title then reuses
+    /// (its ticket goes stale), and written again in the same list: the
+    /// second write re-registers the read-back. The old dedup stopped at the
+    /// stale entry and dropped it, a missed read-back (the title's ocean
+    /// height map read back nothing).
     #[cfg(windows)]
     #[test]
     fn a_rewritten_back_texture_after_reuse_is_read_back() {
         use crate::object::guid;
         use crate::resource::{create_committed, readback_test_descriptions};
         let Some(_) = crate::host::host() else {
-            return;
+            return; // no host GPU here
         };
+        // Make 256x256 R32_FLOAT a back-copied kind, deterministically,
+        // independent of the environment.
         let _test_kinds = ResetTestKinds(crate::texback::TEST_KINDS.replace(Some(&[(256, 256, 41)])));
         struct ResetTestKinds(Option<&'static [(u64, u32, u32)]>);
         impl Drop for ResetTestKinds {
@@ -2572,12 +2629,16 @@ mod tests {
         let host = host_list(list).expect("a host list");
         host.texture_written(tex);
         assert!(host.back_wanted_fresh(tex), "the write registered a read-back");
+        // The title reuses the texture's memory: the ticket goes stale.
         crate::texback::replaced(at);
         assert!(!host.back_wanted_fresh(tex), "the reuse invalidated the read-back");
+        // Written again in the same list: the read-back is re-registered, not
+        // dropped (the old dedup saw an entry for this texture and stopped).
         host.texture_written(tex);
         assert!(host.back_wanted_fresh(tex), "the second write re-registered the read-back");
         host.close();
         assert_eq!(host.texture_back_count(), 1, "the rewritten texture was read back");
+        eprintln!("texture ticket regression exercised on host device");
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
         assert_eq!(release(tex), 0);

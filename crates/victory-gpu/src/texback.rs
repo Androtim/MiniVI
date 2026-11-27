@@ -133,8 +133,10 @@ impl Target {
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
 
-    /// Whether the ticket is still valid (the texture's memory has not been
-    /// reused or remapped since registration).
+    /// Whether the ticket is still valid: the texture's memory has not been
+    /// reused or remapped since it was registered. A stale target is
+    /// re-registered so the read-back tracks the memory the texture is in
+    /// now, not where it was when it was last written.
     pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
 }
 
@@ -282,7 +284,7 @@ pub(crate) fn land(back: &Back) {
 }
 
 /// Register the initialized upload row copied by the host's test list as a
-/// linear 1x1 readback, so it goes through the real landing/reset path.
+/// linear 1×1 readback, so it goes through the real landing/reset path.
 #[cfg(test)]
 pub(crate) fn buffer_back_for_test(buffer: crate::host::TextureReadback, dst: &mut [u8; 256]) -> Back {
     use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
@@ -317,7 +319,6 @@ pub(crate) fn buffer_back_for_test(buffer: crate::host::TextureReadback, dst: &m
         ticket: track(at, at, at + dst.len()),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

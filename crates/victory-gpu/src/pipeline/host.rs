@@ -150,84 +150,6 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
-/// LOCAL (fxceless a35c557393, `VICTORY_TARGET_VARIANTS`): the formats of
-/// what a draw draws into, as the host has them: the eight render targets
-/// (0 where there is none), then depth (0 for none).
-pub(crate) type TargetFormats = [u32; 9];
-
-/// Whether a draw into views of the formats `bound` cannot go to the host
-/// with a pipeline that declares `declared`: a render target slot for which
-/// the pipeline declares a format has a view of another format bound. On
-/// the console the view's format rules (fxceless run 289: a full-screen
-/// zoom and blur declaring R10G10B10A2_UNORM drawn into R11G11B10_FLOAT);
-/// on the host that draw is an invalid call, undefined without the debug
-/// layer. Empty slots, views in undeclared slots and depth do not count.
-pub(crate) fn formats_differ(declared: &TargetFormats, bound: &TargetFormats) -> bool {
-    declared[..8].iter().zip(&bound[..8]).any(|(&d, &b)| d != 0 && b != 0 && b != d)
-}
-
-/// The formats a pipeline for a draw into `bound` declares: the title's,
-/// but the declared render target slots with a view bound take its format.
-pub(crate) fn formats_for(declared: &TargetFormats, bound: &TargetFormats) -> TargetFormats {
-    let mut formats = *declared;
-    for i in 0..8 {
-        if declared[i] != 0 && bound[i] != 0 {
-            formats[i] = bound[i];
-        }
-    }
-    formats
-}
-
-impl GraphicsState {
-    /// The formats the state declares ([`TargetFormats`]).
-    pub(crate) fn formats(&self) -> TargetFormats {
-        let mut formats = [0; 9];
-        let n = (self.targets.NumRenderTargets as usize).min(8);
-        for (to, from) in formats.iter_mut().zip(&self.targets.RTFormats[..n]) {
-            *to = from.0 as u32;
-        }
-        formats[8] = self.depth_format.0 as u32;
-        formats
-    }
-
-    /// The same state for a draw into views of the formats `bound` (from
-    /// [`formats_for`]): those render target formats, everything else the
-    /// title's (blending on integer targets goes off when the host pipeline
-    /// is made, [`host_blend`]). Its description differs, so it has a name
-    /// of its own in the library.
-    pub(crate) fn with_formats(&self, bound: &TargetFormats) -> GraphicsState {
-        let names = self.names.clone();
-        let inputs: Vec<D3D12_INPUT_ELEMENT_DESC> = self
-            .inputs
-            .iter()
-            .zip(&names)
-            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                SemanticName: windows::core::PCSTR(name.as_ptr().cast()),
-                ..*e
-            })
-            .collect();
-        let mut targets = self.targets;
-        let n = (targets.NumRenderTargets as usize).min(8);
-        for (to, &from) in targets.RTFormats[..n].iter_mut().zip(bound) {
-            *to = DXGI_FORMAT(from as i32);
-        }
-        GraphicsState {
-            blend: self.blend,
-            sample_mask: self.sample_mask,
-            rasterizer: self.rasterizer,
-            depth: self.depth,
-            depth_bounds: self.depth_bounds,
-            inputs,
-            names,
-            strip_cut: self.strip_cut,
-            topology: self.topology,
-            targets,
-            depth_format: self.depth_format,
-            samples: self.samples,
-        }
-    }
-}
-
 impl GraphicsState {
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
@@ -600,11 +522,17 @@ impl HostPipeline {
                     // address and its fault notes.
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::SLOT_MEET
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
+                            || slot == victory_shader::emit::SLOT_TABLE_STRIDES
+                            || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV)
+                        && !ours
+                        && bounded_root_srvs()
+                    {
                         // A one-view table: the view's size bounds the
                         // reads (and a root UAV's writes), which a root
                         // descriptor leaves unbounded.
@@ -1094,6 +1022,36 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// Whether the D3D12 runtime accepts the directly-indexed heap flags
+/// (CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED).
+/// Probed once with an empty root signature; false on runtimes that
+/// predate shader model 6.6 bindless.
+fn bindless_heaps_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 0,
+                    pParameters: std::ptr::null(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                },
+            },
+        };
+        // SAFETY: an empty description; the blob is dropped at once.
+        let ok = unsafe {
+            let mut blob: Option<ID3DBlob> = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).is_ok()
+        };
+        tracing::info!(ok, "bindless heap root signature flags probe");
+        ok
+    })
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -1105,6 +1063,12 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
+    let bindless = if bindless_heaps_supported() {
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAGS(0)
+    };
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -1113,9 +1077,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: input | bindless,
             },
         },
     };
@@ -1195,6 +1157,42 @@ mod tests {
 
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
+    /// A name the library does not have is `E_INVALIDARG`, the code the trail now calls
+    /// "not in it yet" (issue #70 read it as the library refusing the pipeline).
+    #[test]
+    fn a_name_the_library_lacks_is_invalid_arg() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+            return;
+        };
+        let (root, _) = root_signature(&host.device, &[], &[], true).unwrap();
+        // SAFETY: an empty library (no blob at all, which every runtime takes), then a
+        // lookup of a name never stored with a description that names a live root signature.
+        unsafe {
+            let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+            (Interface::vtable(&device).CreatePipelineLibrary)(
+                device.as_raw(),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary::IID,
+                &mut raw,
+            )
+            .ok()
+            .expect("an empty pipeline library");
+            let library = ID3D12PipelineLibrary::from_raw(raw);
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                ..Default::default()
+            };
+            let got = library.LoadComputePipeline::<_, ID3D12PipelineState>(windows::core::w!("never stored"), &desc);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            assert_eq!(got.err().map(|e| e.code()), Some(windows::Win32::Foundation::E_INVALIDARG));
+        }
+    }
+
     #[test]
     fn a_mesh_pipeline_loads_from_the_library() {
         let Some(host) = host() else {
@@ -1535,26 +1533,6 @@ mod tests {
                 pixel
             }
         };
-
-        let is_software = {
-            use windows::Win32::Graphics::Dxgi::{
-                CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
-                IDXGIFactory4,
-            };
-            // SAFETY: valid D3D12 device and DXGI factory query.
-            unsafe {
-                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
-                    .and_then(|a| a.GetDesc1())
-                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414)
-            }
-        };
-        if is_software {
-            eprintln!(
-                "WARP software adapter does not cull depth-bounds with DepthEnable=false; skipping draw assertions"
-            );
-            return;
-        }
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");

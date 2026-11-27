@@ -62,6 +62,13 @@ pub(super) struct Placed {
 }
 
 impl Placed {
+    /// Whether the card copies the bytes the CPU takes out of the source at
+    /// submission (out of the list's upload memory), not a host copy that
+    /// shaders write.
+    pub(super) fn from_upload(&self) -> bool {
+        self.from.is_some()
+    }
+
     /// Whether flights that write `written` are waited for.
     pub(super) fn waits(&self, written: &[(usize, usize)]) -> Waits {
         let source = touches(written, self.src, self.src + self.len);
@@ -119,6 +126,7 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
                 let (at, len) = staging.memory();
                 touches(&ranges, at, at + len)
             }
+            &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
             Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
             Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
             _ => false,

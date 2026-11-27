@@ -72,12 +72,10 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
 }
 
 /// Increments the reference count only if the object still has live references.
-#[cfg(windows)]
 pub(crate) fn add_ref_alive(this: This) -> bool {
     // SAFETY: `this` is one of our objects, not freed yet.
     let refs = &unsafe { &*this }.refs;
-    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then_some(n + 1))
-        .is_ok()
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n + 1)).is_ok()
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {

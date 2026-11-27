@@ -43,14 +43,12 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// above) below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-        return;
-    }
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
+    // A full pool can become idle while another subsystem needs the VRAM.
+    // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
@@ -99,7 +97,8 @@ pub(crate) fn on() -> bool {
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
-/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12;
+/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, scaled
+/// by local VRAM — `2` on `<= 9 GiB`, `4` on `<= 12 GiB`, `12` above;
 /// 0: none, and new blocks are used at once, as before).
 ///
 /// A page fault of lists already on the card, in a texture made the same
@@ -225,9 +224,6 @@ struct Block<B> {
     since: u64,
 }
 
-/// Cooldown after a failed block allocation before retrying growth (ms).
-const GROWTH_BACKOFF_MS: u64 = 500;
-
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
@@ -236,31 +232,12 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
-    /// Timestamp before which another failed block allocation will not be retried.
     retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
         Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
-    }
-
-    /// Allocates a new backing block unless a recent allocation refusal is still
-    /// cooling down, preventing repeated failing driver calls on saturated GPUs.
-    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
-        if now < self.retry_growth_at {
-            return None;
-        }
-        match make() {
-            Some(memory) => {
-                self.retry_growth_at = 0;
-                Some(memory)
-            }
-            None => {
-                self.retry_growth_at = now.saturating_add(GROWTH_BACKOFF_MS);
-                None
-            }
-        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -302,6 +279,8 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
+        // A failed 64 MiB block must not trigger another driver call for each
+        // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match found {
             Some(found) => found,
             None => {
@@ -330,6 +309,17 @@ impl<B: Clone> Pool<B> {
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
+    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if now < self.retry_growth_at {
+            return None;
+        }
+        let block = make();
+        if block.is_none() {
+            self.retry_growth_at = now.saturating_add(500);
+        }
+        block
+    }
+
     fn add(&mut self, memory: B, made: u64) -> usize {
         let i = match self.blocks.iter().position(Option::is_none) {
             Some(i) => i,
@@ -352,8 +342,6 @@ impl<B: Clone> Pool<B> {
         self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
     }
 
-    /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
-    /// empty blocks are looked at even if no piece came back.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
@@ -367,8 +355,8 @@ impl<B: Clone> Pool<B> {
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
-        if sweep || any || most < self.spare {
-            self.spare = most;
+        let previous = std::mem::replace(&mut self.spare, most);
+        if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
@@ -432,8 +420,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
     let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
-        // while commit is short; those a draw samples now still get one.)
+        // Only gate speculative bindless prefetch on staging-pool growth
+        // headroom; table-bound textures and decoration bakes are sampled
+        // immediately and would otherwise read uninitialized/reused VRAM.
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
@@ -666,6 +655,40 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_block_is_not_retried_for_each_small_upload() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let calls = std::cell::Cell::new(0);
+        let refuse = || { calls.set(calls.get() + 1); None };
+        for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
+            assert!(pool.take(size, 512, 12, refuse).is_none());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(pool.take(24080, 512, 1012, || Some(1)).is_some());
+    }
+
+    #[test]
+    fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
+        pool.give(resting, 0);
+        for i in 0..12 {
+            pool.add(i, 0);
+        }
+        pool.reclaim(0, SPARE_KEPT, true);
+        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
+        pool.reclaim(REST - 1, SPARE, true);
+        assert_eq!(pool.blocks(), SPARE + 1);
+        assert_eq!(pool.resting.len(), 1);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.resting.is_empty());
+        pool.give(held, REST);
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
         let mut pool: Pool<u32> = Pool::new(SPARE);
         let made = std::cell::Cell::new(0);
@@ -771,42 +794,5 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
-    }
-
-    #[test]
-    fn pool_growth_backs_off_after_refusal() {
-        let mut pool: Pool<u32> = Pool::new(4);
-        let calls = std::cell::Cell::new(0);
-        let allow = std::cell::Cell::new(true);
-        let mut next = 1u32;
-        let mut make = || {
-            calls.set(calls.get() + 1);
-            if allow.get() {
-                let id = next;
-                next += 1;
-                Some(id)
-            } else {
-                None
-            }
-        };
-        // First allocation succeeds and still leaves half the block free.
-        let (first, mem, _) = pool.take(BLOCK / 2, 65536, 100, &mut make).unwrap();
-        assert_eq!((mem, calls.get()), (1, 1));
-        allow.set(false);
-        // Existing free slice in block 1 satisfies another half-block during/before backoff.
-        assert_eq!(pool.take(BLOCK / 2, 65536, 100, &mut make).unwrap().1, 1);
-        // Block 1 is now full; refusal arms 500 ms backoff.
-        assert!(pool.take(BLOCK / 2, 65536, 100, &mut make).is_none());
-        assert_eq!(calls.get(), 2);
-        // Calls inside cooldown must not invoke `make` again, while freeing lets existing space work.
-        assert!(pool.take(BLOCK / 2, 65536, 100 + GROWTH_BACKOFF_MS - 1, &mut make).is_none());
-        assert_eq!(calls.get(), 2);
-        pool.give(first, 100);
-        assert_eq!(pool.take(BLOCK / 2, 65536, 100 + REST, &mut make).unwrap().1, 1);
-        assert_eq!(calls.get(), 2);
-        // After cooldown elapses, growth retries and succeeds.
-        allow.set(true);
-        assert_eq!(pool.take(BLOCK / 2, 65536, 100 + GROWTH_BACKOFF_MS, &mut make).unwrap().1, 2);
-        assert_eq!(calls.get(), 3);
     }
 }

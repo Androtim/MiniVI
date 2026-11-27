@@ -59,9 +59,9 @@ struct Ray {
     inverse: [V; 3],
 }
 
-/// LOCAL (from our wt5): `VICTORY_BVH_MISS=1` (off by default): the node test
-/// misses every node. While the structure builder is off the structures are
-/// never built, and a walk of what lies in their memory is not the console's.
+/// `VICTORY_BVH_MISS=1` (off by default): the node test misses every node.
+/// While the structure builder is off the structures are never built, and a
+/// walk of what lies in their memory is not the console's.
 fn bvh_miss() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
@@ -199,9 +199,9 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        // LOCAL (from our wt5): with `VICTORY_BVH_MISS=1` every node is missed
-        // without being read: a box returns no child and a triangle the
-        // triangle miss, so a walk ends at its first node.
+        // With `VICTORY_BVH_MISS=1` every node is missed without being read:
+        // a box returns no child and a triangle the triangle miss, so a walk
+        // ends at its first node.
         let boxes = if bvh_miss() {
             [self.s.m.i32(bvh::NONE); 4]
         } else {
