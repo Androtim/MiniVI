@@ -31,5 +31,6 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: |
-          cargo test --workspace --exclude victory-gpu --locked
+          cargo test --workspace --exclude victory-gpu --exclude victory-shader --locked
+          cargo test -p victory-shader --locked -- --test-threads=1
           cargo test -p victory-gpu --locked -- --test-threads=1
