@@ -69,6 +69,23 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+/// Tiled water volume lighting compute shaders (64-lane waves) that on 32-lane
+/// hosts translate only in a wave-wide form leaving dark rectangular blocks on
+/// open water and costing ~15 ms GPU/frame. Skipped on 32-lane hosts by default;
+/// `VICTORY_WATER_LIGHT=1` re-enables them.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_hash_skipped(hash: &str, max_wave: u32, force_on: bool) -> bool {
+    !force_on && max_wave == 32 && WATER_LIGHT.contains(&hash)
+}
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    let force_on = *ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"));
+    let max_wave = victory_shader::emit::host_settings()[0];
+    shaders.iter().any(|s| water_light_hash_skipped(&s.hash, max_wave, force_on))
+}
+
 /// This producer writes head mappings retained for the run. Losing its first
 /// dispatch leaves later skinning reading uninitialized data even after the
 /// compiler queue has drained.
@@ -100,6 +117,13 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
+    }
+    if water_light_left_out(shaders) {
+        tracing::info!(
+            shaders = ?shaders,
+            "skipping tiled water light on 32-lane host (set VICTORY_WATER_LIGHT=1 to enable)"
+        );
+        return Some("water light skipped on 32-lane host (VICTORY_WATER_LIGHT=1)");
     }
     None
 }
@@ -876,5 +900,15 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn water_light_skips_only_on_32_lane_unless_enabled() {
+        for hash in WATER_LIGHT {
+            assert!(water_light_hash_skipped(hash, 32, false));
+            assert!(!water_light_hash_skipped(hash, 32, true));
+            assert!(!water_light_hash_skipped(hash, 64, false));
+        }
+        assert!(!water_light_hash_skipped("0123456789abcdef", 32, false));
     }
 }

@@ -250,17 +250,34 @@ struct Pool {
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
 /// their preludes and buffers, 12 % of the submitting thread in the opening,
-/// profile cpu-1). `VICTORY_LIST_IDLE_MOST=N`: N instead of 512, from 16 to
-/// 4096.
+/// profile cpu-1). `VICTORY_LIST_IDLE_MOST=N` (or `VICTORY_LIST_POOL_MOST=N`):
+/// N instead of 512, from 16 to 4096.
 #[cfg(windows)]
 fn idle_most() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         let set = std::env::var("VICTORY_LIST_IDLE_MOST")
             .ok()
+            .or_else(|| std::env::var("VICTORY_LIST_POOL_MOST").ok())
             .and_then(|v| v.trim().parse().ok());
         set.map_or(512, |n: usize| n.clamp(16, 4096))
     })
+}
+
+/// Immediately drops excess idle host lists down to 64 under host RAM pressure.
+#[cfg(windows)]
+pub(crate) fn trim_on_pressure() {
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let excess = idle.lists.len().saturating_sub(64);
+        if excess > 0 {
+            dropped = idle.lists.drain(..excess).collect();
+            idle.bytes -= dropped.iter().map(|Idle(_, b)| b).sum::<u64>();
+            idle.low = idle.low.min(idle.lists.len());
+        }
+    }
+    drop(dropped);
 }
 
 /// The most upload memory idle host lists may keep between them (a list

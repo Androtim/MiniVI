@@ -99,6 +99,12 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_counted(parts, counted_in_threads(parts))
 }
 
+/// `VICTORY_NAN_SCRUB=1` (off by default): see `Lower::scrub_nan`.
+pub(crate) fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
 /// Whether the title dispatches the program by a count of threads whose last
 /// group may be partial: the structure builder's programs of one dimension.
 /// Their lanes past the count must not run (they count the lanes of a wave
@@ -11841,6 +11847,9 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            for v in &mut vals {
+                *v = self.scrub_nan(*v);
+            }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -12979,6 +12988,21 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// With `VICTORY_NAN_SCRUB=1` (off by default), returns `f` or 0 where it
+    /// is NaN or infinite. Used on pixel shader color exports and float image
+    /// stores so NaN/Inf values do not spread through bloom/temporal history.
+    fn scrub_nan(&mut self, f: V) -> V {
+        if !nan_scrub() {
+            return f;
+        }
+        let c = self.cur;
+        let a = self.unary(6, f);
+        let inf = self.s.m.f32(0x7f80_0000);
+        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -13164,6 +13188,7 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        let colour = self.s.pixel && matches!(e.target, Target::Color(_));
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -13182,12 +13207,16 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    (".f32", if colour { self.scrub_nan(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
+                    let f = if colour { self.scrub_nan(f) } else { f };
                     (".f32", f)
                 }
                 _ => (".i32", x),

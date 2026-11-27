@@ -1346,18 +1346,39 @@ fn snapshots_kept() -> usize {
     *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
 }
 
+fn snapshot_pool_bytes(limited_ram: bool, override_mb: Option<u64>) -> usize {
+    if let Some(mb) = override_mb {
+        return usize::try_from(mb << 20).unwrap_or(usize::MAX);
+    }
+    if limited_ram { 128 << 20 } else { 512 << 20 }
+}
+
+/// Drops cached CPU snapshot buffers immediately under host memory pressure.
+pub(crate) fn trim_snapshot_pool() {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let gone = std::mem::take(&mut *pool);
+    drop(pool);
+    drop(gone);
+}
+
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// the largest, and of those the largest one and the next ones up to the
+/// RAM-scaled cap bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    let cap_bytes = snapshot_pool_bytes(crate::residency::limited_host_ram(), override_mb);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > cap_bytes {
             break;
         }
         kept += 1;
@@ -1557,8 +1578,10 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                let mut priority = crate::cores::Priority::new();
                 let workers = WORKERS.get().expect("made above");
                 loop {
+                    priority.keep();
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
@@ -5268,24 +5291,43 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// What shaders write there by address is not brought back, so the copy is
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
+fn memory_card_budget(vram_budget: Option<u64>, override_mb: Option<u64>) -> (u64, u64) {
+    const GIB: u64 = 1 << 30;
+    if let Some(mb) = override_mb {
+        return (mb << 20, 97);
+    }
+    match vram_budget {
+        Some(budget) if budget <= 9 * GIB => ((budget / 4).min(2048 << 20), 85),
+        Some(budget) if budget <= 12 * GIB => (2048 << 20, 90),
+        _ => (4096 << 20, 97),
+    }
+}
+
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (4 GiB unless
+    // At most so much on the card's own memory (scaled by VRAM unless
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
     // that the side shaders see is in the PC's memory.
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     static USED: AtomicU64 = AtomicU64::new(0);
-    let most = *MOST.get_or_init(|| {
-        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
+    let override_mb = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_CARD_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
     });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let video_memory = host.video_memory();
+    let (most, pct) = memory_card_budget(video_memory.map(|[budget, ..]| budget), override_mb);
+    let room = video_memory.is_none_or(|[budget, used, ..]| used.saturating_add(len) < budget / 100 * pct);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let on_card = if room && USED.load(Ordering::Relaxed).saturating_add(len) <= most {
+        let made = host.uav_buffer(len);
+        if made.is_some() {
+            USED.fetch_add(len, Ordering::Relaxed);
+        }
+        made
     } else {
         None
     };
@@ -5788,6 +5830,21 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn memory_card_and_snapshot_budgets_scale_with_vram_and_ram() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::memory_card_budget(Some(8 * GIB), None), (2048 << 20, 85));
+        assert_eq!(super::memory_card_budget(Some(6 * GIB), None), (1536 << 20, 85));
+        assert_eq!(super::memory_card_budget(Some(12 * GIB), None), (2048 << 20, 90));
+        assert_eq!(super::memory_card_budget(Some(24 * GIB), None), (4096 << 20, 97));
+        assert_eq!(super::memory_card_budget(None, None), (4096 << 20, 97));
+        assert_eq!(super::memory_card_budget(Some(8 * GIB), Some(512)), (512 << 20, 97));
+
+        assert_eq!(super::snapshot_pool_bytes(true, None), 128 << 20);
+        assert_eq!(super::snapshot_pool_bytes(false, None), 512 << 20);
+        assert_eq!(super::snapshot_pool_bytes(true, Some(64)), 64 << 20);
     }
 }
 

@@ -39,7 +39,8 @@ const STAGING_KEPT: usize = 8;
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// scaled by local VRAM (`3` on `<= 9 GiB`, `8` on `<= 12 GiB`, `SPARE_KEPT`
+/// above) below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
@@ -56,16 +57,27 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             0
         } else if pressure {
             1
+        } else if crate::residency::limited_host_ram() {
+            limit.min(2)
         } else {
-            limit
+            limit.min(STAGING_KEPT)
         };
         pool.reclaim(tick, staging_limit, true);
     }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    const GIB: u64 = 1 << 30;
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && budget > 0 && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            if budget <= 9 * GIB {
+                3
+            } else if budget <= 12 * GIB {
+                8
+            } else {
+                SPARE_KEPT
+            }
+        }
         _ => SPARE,
     }
 }
@@ -85,7 +97,8 @@ pub(crate) fn on() -> bool {
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
-/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12;
+/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, scaled
+/// by local VRAM — `2` on `<= 9 GiB`, `4` on `<= 12 GiB`, `12` above;
 /// 0: none, and new blocks are used at once, as before).
 ///
 /// A page fault of lists already on the card, in a texture made the same
@@ -96,9 +109,30 @@ pub(crate) fn on() -> bool {
 /// `indirect::tests::new_blocks_under_readers` never loses it). A block that
 /// every submission begun before its making has left behind ([`Ripe`]) has
 /// no such lists: pieces are cut from those first.
+fn default_ripe_blocks(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match vram_budget {
+        Some(budget) if budget <= 9 * GIB => 2,
+        Some(budget) if budget <= 12 * GIB => 4,
+        _ => 12,
+    }
+}
+
+fn ripe_blocks_for(override_val: Option<usize>, vram_budget: Option<u64>) -> usize {
+    override_val.unwrap_or_else(|| default_ripe_blocks(vram_budget))
+}
+
 fn ahead() -> usize {
-    static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let override_val = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    let budget = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .map(|[budget, ..]| budget);
+    ripe_blocks_for(override_val, budget)
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -599,10 +633,25 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const GIB: u64 = 1 << 30;
+        assert_eq!(spares(Some([24 * GIB, 20 * GIB, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([12 * GIB, 9 * GIB, 0, 0]), true), 8);
+        assert_eq!(spares(Some([8 * GIB, 6 * GIB, 0, 0]), true), 3);
+        assert_eq!(spares(Some([24 * GIB, 21 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([8 * GIB, 7 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([24 * GIB, 2 * GIB, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn ripe_blocks_scale_with_vram_and_honor_override() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(ripe_blocks_for(None, Some(8 * GIB)), 2);
+        assert_eq!(ripe_blocks_for(None, Some(12 * GIB)), 4);
+        assert_eq!(ripe_blocks_for(None, Some(24 * GIB)), 12);
+        assert_eq!(ripe_blocks_for(None, None), 12);
+        assert_eq!(ripe_blocks_for(Some(0), Some(8 * GIB)), 0);
+        assert_eq!(ripe_blocks_for(Some(6), Some(8 * GIB)), 6);
     }
 
     #[test]
