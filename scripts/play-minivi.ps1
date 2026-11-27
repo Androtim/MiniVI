@@ -6,6 +6,7 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [switch]$NoSmoothMotion,
     [switch]$RayTracing,
+    [switch]$Amd,
     [string]$Adapter,
     [hashtable]$More = @{}
 )
@@ -31,7 +32,7 @@ $maxDim = switch ($Preset) {
     'quality-720p'  { '2048' }
     'native-1080p'  { '2048' }
 }
-$bakeMb = if ($Preset -eq 'perf-540p') { '128' } else { '256' }
+$bakeMb = if ($Preset -eq 'perf-540p') { '128' } else { '512' }
 
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT   = '1'
@@ -92,13 +93,20 @@ if ($RayTracing) {
     $settings.VICTORY_BVH_BUILDER = '1'
     $settings.VICTORY_FIRSTLANE_OWN = '1'
     $settings.VICTORY_RT_MEMORY_MB = '1024'
-    $settings.VICTORY_CARD_BUFFERS_MB = '768'
+    $settings.VICTORY_BVH_FAULTS_ALL = '8192'
+    $settings.VICTORY_AMBIENT_RT = '0.5,2.0,0.8'
+    $settings.VICTORY_CARD_BUFFERS_MB = '512'
     $settings.VICTORY_SKIP_PIPELINES = 'none'
     foreach ($off in 'VICTORY_BVH_MISS', 'VICTORY_AMBIENT', 'VICTORY_AMBIENT_AIR', 'VICTORY_AMBIENT_MOST', 'VICTORY_AMBIENT_SHADE', 'VICTORY_AMBIENT_REFLECT', 'VICTORY_TEXTURE_MIP_DROP') {
         $settings.Remove($off)
     }
 } elseif (Test-Path $rtList) {
     $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
+}
+if ($Amd) {
+    foreach ($off in 'VICTORY_RELAY', 'VICTORY_RELAY_COPY', 'VICTORY_RELAY_FLUSH_TABLES') {
+        $settings.Remove($off)
+    }
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }

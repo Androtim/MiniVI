@@ -60,6 +60,23 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+/// Tiled water volume lighting compute shaders (64-lane waves) that on 32-lane
+/// hosts translate only in a wave-wide form leaving dark rectangular blocks on
+/// open water and costing ~15 ms GPU/frame. Skipped on 32-lane hosts by default;
+/// `VICTORY_WATER_LIGHT=1` re-enables them.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_hash_skipped(hash: &str, max_wave: u32, force_on: bool) -> bool {
+    !force_on && max_wave == 32 && WATER_LIGHT.contains(&hash)
+}
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    let force_on = *ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"));
+    let max_wave = victory_shader::emit::host_settings()[0];
+    shaders.iter().any(|s| water_light_hash_skipped(&s.hash, max_wave, force_on))
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
@@ -89,6 +106,13 @@ impl Pending {
 
     fn make(&self) {
         self.make_with(|| {
+            if water_light_left_out(&self.shaders) {
+                tracing::info!(
+                    shaders = ?self.shaders,
+                    "skipping tiled water light on 32-lane host (set VICTORY_WATER_LIGHT=1 to enable)"
+                );
+                return None;
+            }
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
@@ -121,6 +145,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
+            if water_light_left_out(&p.shaders) {
+                return Some("water light skipped on 32-lane host (VICTORY_WATER_LIGHT=1)".into());
+            }
             let failed: Vec<String> = p
                 .shaders
                 .iter()
@@ -683,6 +710,16 @@ mod tests {
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn water_light_skips_only_on_32_lane_unless_enabled() {
+        for hash in WATER_LIGHT {
+            assert!(water_light_hash_skipped(hash, 32, false));
+            assert!(!water_light_hash_skipped(hash, 32, true));
+            assert!(!water_light_hash_skipped(hash, 64, false));
+        }
+        assert!(!water_light_hash_skipped("0123456789abcdef", 32, false));
     }
 
     /// Passes over the screen go before all others, and workers of their own
