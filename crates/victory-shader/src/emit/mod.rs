@@ -175,6 +175,14 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+fn wave_deep_skips_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+fn wave32_lane_mask_widen_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` of a console pixel program: the
 /// depth and stencil tests (and the depth write) run before the program, as
 /// HLSL's `[earlydepthstencil]` asks.
@@ -637,17 +645,6 @@ fn emit_forms(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
-    // Keep the general wave-wide form opt-in: the game run lost the GPU after these
-    // barriers were enabled automatically for every one-wave group. The insertion guard
-    // below still applies to opt-in shaders.
-    let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
-    let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-        && matches!(
-            c.digest,
-            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
-                | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
-        );
-    let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -802,8 +799,8 @@ fn emit_forms(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=1` opts in.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_some_and(|v| v == "1");
+                // On by default; `VICTORY_WAVE_DEEP_SKIPS=0` turns it off.
+                let deep_on = wave_deep_skips_enabled(std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").as_deref());
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -882,10 +879,15 @@ fn emit_forms(
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // lowering has named the skipped blocks). Stays on by default (`VICTORY_WAVE_WIDE=0`
+    // turns it off).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs && what == lower::LANE_MASK && wide_on =>
+            if native.stage == HwStage::Cs
+                && what == lower::LANE_MASK
+                && wave32_lane_mask_widen_enabled(
+                    std::env::var_os("VICTORY_WAVE_WIDE").as_deref(),
+                ) =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
@@ -3566,5 +3568,17 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn wave64_deep_skips_and_wave32_mask_widen_default_on() {
+        use std::ffi::OsStr;
+        assert!(super::wave_deep_skips_enabled(None));
+        assert!(super::wave_deep_skips_enabled(Some(OsStr::new("1"))));
+        assert!(!super::wave_deep_skips_enabled(Some(OsStr::new("0"))));
+
+        assert!(super::wave32_lane_mask_widen_enabled(None));
+        assert!(super::wave32_lane_mask_widen_enabled(Some(OsStr::new("1"))));
+        assert!(!super::wave32_lane_mask_widen_enabled(Some(OsStr::new("0"))));
     }
 }

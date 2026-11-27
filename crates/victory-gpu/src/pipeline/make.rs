@@ -84,12 +84,16 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 fn is_rt_skin_bytes(bytes: &[u8]) -> bool {
-    bytes_contain(bytes, b"CSComputeSkinning") || bytes_contain(bytes, b"CSGenerateHairVB")
+    bytes_contain(bytes, b"CSComputeSkinning")
 }
 
 fn is_rt_trace_bytes(bytes: &[u8]) -> bool {
     (bytes_contain(bytes, b"CS_ScreenProbes_TraceRays") && bytes_contain(bytes, b"_BVH"))
         || (bytes_contain(bytes, b"CS_RaytraceVBuffer") && !bytes_contain(bytes, b"Voxels"))
+}
+
+fn explicit_no_rt_skip(bvh_miss_no_builder: bool, value: Option<&std::ffi::OsStr>) -> bool {
+    bvh_miss_no_builder && value.is_some_and(|v| v == "0")
 }
 
 fn bvh_miss_no_builder() -> bool {
@@ -179,14 +183,14 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_RT_SKIN: OnceLock<bool> = OnceLock::new();
     let skip_skin = *SKIP_RT_SKIN.get_or_init(|| {
-        bvh_miss_no_builder() && std::env::var_os("VICTORY_RT_SKIN").is_none_or(|v| v != "1")
+        explicit_no_rt_skip(bvh_miss_no_builder(), std::env::var_os("VICTORY_RT_SKIN").as_deref())
     });
     if skip_skin && shaders.iter().any(|s| s.stage == "compute" && is_rt_skin_bytes(&s.container)) {
         return Some("ray-tracing skinning without BVH, left out");
     }
     static SKIP_RT_TRACE: OnceLock<bool> = OnceLock::new();
     let skip_trace = *SKIP_RT_TRACE.get_or_init(|| {
-        bvh_miss_no_builder() && std::env::var_os("VICTORY_RT_TRACE").is_none_or(|v| v != "1")
+        explicit_no_rt_skip(bvh_miss_no_builder(), std::env::var_os("VICTORY_RT_TRACE").as_deref())
     });
     if skip_trace && shaders.iter().any(|s| s.stage == "compute" && is_rt_trace_bytes(&s.container)) {
         return Some("BVH ray-trace without BVH, left out");
@@ -1317,7 +1321,7 @@ mod tests {
     #[test]
     fn rt_only_skin_and_trace_programs_are_known_by_name() {
         assert!(is_rt_skin_bytes(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."));
-        assert!(is_rt_skin_bytes(b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0.."));
+        assert!(!is_rt_skin_bytes(b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0.."));
         assert!(!is_rt_skin_bytes(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0.."));
         assert!(!is_rt_skin_bytes(b"computeclothSkinning"));
 
@@ -1326,6 +1330,15 @@ mod tests {
         assert!(!is_rt_trace_bytes(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."));
         assert!(!is_rt_trace_bytes(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."));
         assert!(!is_rt_trace_bytes(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."));
+    }
+
+    #[test]
+    fn rt_skin_and_trace_run_by_default_unless_opted_out() {
+        use std::ffi::OsStr;
+        assert!(!explicit_no_rt_skip(true, None));
+        assert!(!explicit_no_rt_skip(true, Some(OsStr::new("1"))));
+        assert!(explicit_no_rt_skip(true, Some(OsStr::new("0"))));
+        assert!(!explicit_no_rt_skip(false, Some(OsStr::new("0"))));
     }
 
     #[test]

@@ -83,6 +83,15 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if crate::hooks::watchdog_requested(
+            std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).as_deref(),
+        ) {
+            let size = loaded.info().size_of_image as usize;
+            // SAFETY: just mapped, and no title code has run.
+            let applied =
+                unsafe { crate::hooks::disarm_watchdog(loaded.base(), size, &prepared.original_hash) };
+            tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),

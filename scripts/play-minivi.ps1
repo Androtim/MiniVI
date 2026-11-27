@@ -58,6 +58,7 @@ $settings = @{
     VICTORY_AMBIENT_SETTLE    = '250,3'
     VICTORY_AMBIENT_FLOOR     = '0.04'
     VICTORY_NAN_SCRUB         = '1'
+    VICTORY_NO_WATCHDOG       = '1'
     VICTORY_RENDER_SCALE      = $scale
     VICTORY_UPSCALER          = '6'
     VICTORY_BVH_MISS          = '1'
@@ -65,7 +66,7 @@ $settings = @{
     VICTORY_CARD_BUFFERS_MIN_KB = '64'
     VICTORY_CARD_BUFFERS_MB   = '1024'
     VICTORY_CARD_WINDOWS_MB   = '256'
-    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '512'
     VICTORY_TEXTURE_ROOM_PERCENT = '92'
     VICTORY_DSTORAGE_STAGING_MB = '64'
     VICTORY_EARLY_TEXTURES_MS = '35'
@@ -76,18 +77,15 @@ $settings = @{
     VICTORY_LEVELS_RECLAIM    = '1'
     VICTORY_READBACK_POOL     = '1'
     VICTORY_READBACK_POOL_MB  = '64'
-    VICTORY_LAND_SKIP         = '1'
-    VICTORY_TEXBACK_ASYNC     = '1'
+    VICTORY_TEXBACK_ASYNC     = '0'
     VICTORY_FRESH_OPEN        = '1'
-    VICTORY_PRELUDE_POOL      = '1'
     VICTORY_PORT_GUARD        = '1'
     VICTORY_PORT_JOURNAL      = '1'
     VICTORY_PORT_CONSTANTS    = '1'
     VICTORY_PORT_CBV          = '0'
     VICTORY_HEAP_RECHECK      = '0'
-    VICTORY_RT_NO_ARENAS      = '1'
     VICTORY_LIBRARY_STORE_LATER = '1'
-    VICTORY_PIPELINE_WAIT_MS  = '150'
+    VICTORY_PIPELINE_WAIT_MS  = '500'
     VICTORY_PIPELINE_WORKERS  = '6'
     VICTORY_PIPELINE_LOWEST   = '1'
     VICTORY_D3D12_DRED        = 'light'
@@ -98,19 +96,16 @@ if ($Preset -eq 'quality-720p' -or $Preset -eq 'native-1080p') {
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$rtList = Join-Path $repoRoot 'scripts\rt_off_hashes.txt'
-if (-not $RayTracing -and (Test-Path $rtList)) {
-    $settings.VICTORY_SKIP_PIPELINES_FILE = $rtList
-}
 
 if ($RayTracing) {
     $settings.VICTORY_BVH_BUILDER = '1'
+    $settings.VICTORY_RAYS = '1'
     $settings.VICTORY_FIRSTLANE_OWN = '1'
     $settings.VICTORY_RT_MEMORY_MB = '1024'
     $settings.VICTORY_BVH_FAULTS_ALL = '8192'
     $settings.VICTORY_AMBIENT_RT = '0.5,2.0,0.8'
     $settings.VICTORY_CARD_BUFFERS_MB = '512'
-    foreach ($off in 'VICTORY_BVH_MISS', 'VICTORY_RT_NO_ARENAS', 'VICTORY_AMBIENT', 'VICTORY_AMBIENT_AIR', 'VICTORY_AMBIENT_MOST', 'VICTORY_AMBIENT_SHADE', 'VICTORY_AMBIENT_FLOOR', 'VICTORY_TEXTURE_MIP_DROP') {
+    foreach ($off in 'VICTORY_BVH_MISS', 'VICTORY_AMBIENT', 'VICTORY_AMBIENT_AIR', 'VICTORY_AMBIENT_MOST', 'VICTORY_AMBIENT_SHADE', 'VICTORY_AMBIENT_FLOOR', 'VICTORY_TEXTURE_MIP_DROP') {
         $settings.Remove($off)
     }
 }

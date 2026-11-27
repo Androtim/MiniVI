@@ -117,22 +117,19 @@ fn idle_without_rays(container: &[u8]) -> bool {
 }
 
 /// Whether `VICTORY_HAIR`'s value asks for the hair strands' programs to run:
-/// any value but an empty one, `0`, `off`, `false` or `no` (issue #59: only
-/// whether the variable was set was asked, so `VICTORY_HAIR=0` ran them).
+/// on by default when unset; only an empty value, `0`, `off`, `false` or `no`
+/// skips them.
 fn hair_asked(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|v| {
+    value.is_none_or(|v| {
         let v = v.to_string_lossy();
         !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "off" | "false" | "no")
     })
 }
 
-/// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. `VICTORY_HAIR=1` has them run ([`hair_asked`]).
-/// shortcut: left out, as some of them do not translate (an address from a
-/// phi) and the others draw lines all over the screen without them.
+/// Whether `container` is one of the strand, decal, accessory or LOD-blend
+/// compute programs gated by `VICTORY_HAIR`, given whether `run` is enabled.
 #[cfg(windows)]
-fn hair_strands(container: &[u8]) -> bool {
-    static RUN: OnceLock<bool> = OnceLock::new();
+fn hair_strands_for(container: &[u8], run: bool) -> bool {
     const NAMES: [&[u8]; 18] = [
         b"InterpolateStrand",
         b"HairStrand",
@@ -153,7 +150,7 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if *RUN.get_or_init(|| hair_asked(std::env::var_os("VICTORY_HAIR").as_deref())) {
+    if run {
         return false;
     }
     const END: &[u8] = b"_Wrapped";
@@ -169,6 +166,15 @@ fn hair_strands(container: &[u8]) -> bool {
                 .unwrap_or_default();
             NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
         })
+}
+
+/// Whether a container's program is one of those that animate and draw hair
+/// strands, by its name. On by default; `VICTORY_HAIR=0` opts out ([`hair_asked`]).
+#[cfg(windows)]
+fn hair_strands(container: &[u8]) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    let run = *RUN.get_or_init(|| hair_asked(std::env::var_os("VICTORY_HAIR").as_deref()));
+    hair_strands_for(container, run)
 }
 
 /// The shared container for `bytes`.
@@ -896,15 +902,36 @@ pub(crate) fn container_names(container: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn hair_runs_only_when_asked_for_with_a_value_that_says_so() {
+    fn hair_runs_by_default_unless_opted_out() {
         use std::ffi::OsStr;
-        assert!(!super::hair_asked(None));
+        assert!(super::hair_asked(None));
         for off in ["", "0", " 0 ", "off", "OFF", "false", "no"] {
             assert!(!super::hair_asked(Some(OsStr::new(off))), "{off:?}");
         }
         for on in ["1", "yes", "on", "true", "2"] {
             assert!(super::hair_asked(Some(OsStr::new(on))), "{on:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn critical_hair_decal_and_spline_programs_are_not_skipped_by_default() {
+        let default_run = super::hair_asked(None);
+        for name in [
+            b"..\0CSGenerateHair_aabbccdd_Wrapped\0..".as_slice(),
+            b"..\0HairStrand_11223344_Wrapped\0..",
+            b"..\0CS_WavePerSpline_55667788_Wrapped\0..",
+            b"..\0CS_ProjDecalCut_9900aabb_Wrapped\0..",
+            b"..\0CS_LodBlend_ccddeeff_Wrapped\0..",
+            b"..\0CS_GenerateAccessories_01234567_Wrapped\0..",
+            b"..\0CS_Tiling_Generate_Water_4daa67a3_Wrapped\0..",
+        ] {
+            assert!(!super::hair_strands_for(name, default_run), "{name:?}");
+        }
+        assert!(super::hair_strands_for(
+            b"..\0CSGenerateHair_aabbccdd_Wrapped\0..",
+            false
+        ));
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
