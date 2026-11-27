@@ -68,6 +68,19 @@ $env:VICTORY_NAN_SCRUB = '1'
 
 ---
 
+## Contributing, Bug Reports & Pull Requests
+
+When opening an **Issue** or **Pull Request** (or sharing performance/stability logs), please include both your **hardware rig specs** and the **exact run settings** you used. Behavior and bottlenecks differ drastically between configurations (for example, `1080p + Ray Tracing + DLSS + Frame Generation` vs. `720p + no RT + no Frame Generation`, or `8 GB VRAM` vs. `16+ GB VRAM`).
+
+Please include:
+1. **Rig Specs:** CPU, GPU + VRAM size, system RAM, Windows version, and GPU driver version.
+2. **Run Settings & Build Profile:** build profile (`release` or `diag`) and commit SHA, console profile (`series-s` / `series-x`), internal resolution / render scale (`540p` / `720p` / `1080p` / `1440p`), Ray Tracing (`off` or `-RayTracing`), Upscaling (`off` / DLSS mode / title upscaler), Frame Generation (`off` / DLSS `2x`–`6x` / FSR 3 `2x`), exact launcher command/preset + any custom `VICTORY_*` overrides, and the scene/area + session duration tested.
+3. **Measured Results (for PRs & benchmarks):** **base FPS without Frame Generation** alongside FG FPS, average/peak VRAM & RAM usage, and whether crashes/DRED resets occurred.
+
+*(Templates in [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) and [`.github/ISSUE_TEMPLATE/bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md) will pre-fill these fields automatically.)*
+
+---
+
 ## Credits
 
 Built on [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA), which itself builds on [readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound), [Marvisak/VIctory](https://github.com/Marvisak/VIctory), [fxceless/victory-fork](https://github.com/fxceless/victory-fork), [codec-d/cool_fox](https://github.com/codec-d/cool_fox), [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD), and [DexNom/VIctory](https://github.com/DexNom/VIctory).
