@@ -13,6 +13,7 @@ use crate::host::Host;
 // The root signature is made by `root_signature`, not taken from the shader:
 // under Wine `D3DCompile` is vkd3d-shader's, which embeds no `[RootSignature]`.
 const SOURCE: &str = r#"
+cbuffer Flags : register(b0) { uint flags; };
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
@@ -23,10 +24,37 @@ V vs(uint id : SV_VertexID) {
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
+float3 linear_to_srgb(float3 x) {
+    x = saturate(x);
+    float3 lo = x * 12.92;
+    float3 hi = 1.055 * pow(max(x, 1e-6), 1.0 / 2.4) - 0.055;
+    return (x <= 0.0031308) ? lo : hi;
+}
+float3 srgb_to_linear(float3 x) {
+    x = saturate(x);
+    float3 lo = x / 12.92;
+    float3 hi = pow((x + 0.055) / 1.055, 2.4);
+    return (x <= 0.04045) ? lo : hi;
+}
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    // If Plane 0 was sampled as _SRGB (hardware decoded to linear), blend in
+    // linear space and re-encode to sRGB before writing the UNORM swapchain.
+    bool s_lin = (flags & 1u) != 0u;
+    bool o_lin = (flags & 2u) != 0u;
+    float3 col;
+    if (s_lin) {
+        float3 o_rgb = o_lin ? o.rgb : srgb_to_linear(o.rgb);
+        col = linear_to_srgb(o_rgb + s.rgb * (1.0 - saturate(o.a)));
+    } else {
+        float3 o_rgb = o_lin ? linear_to_srgb(o.rgb) : o.rgb;
+        col = o_rgb + s.rgb * (1.0 - saturate(o.a));
+    }
+    // Subtle 1-LSB Interleaved Gradient Noise dithering breaks up 8-bit banding.
+    float ign = frac(52.9829189 * frac(dot(v.at.xy, float2(0.06711056, 0.00583715))));
+    col = saturate(col + (ign - 0.5) / 255.0);
+    return float4(col, 1);
 }
 "#;
 
@@ -83,13 +111,26 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
         Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
     };
-    let param = D3D12_ROOT_PARAMETER1 {
-        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+    let params = [
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         },
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-    };
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+    ];
     let sampler = D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -109,8 +150,8 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
         Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
             Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                NumParameters: 1,
-                pParameters: &param,
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
                 NumStaticSamplers: 1,
                 pStaticSamplers: &sampler,
                 Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
@@ -231,12 +272,26 @@ impl Composer {
                 host.device
                     .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
             }
+            let is_srgb = |fmt: DXGI_FORMAT| {
+                fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+            };
+            let flags: u32 = u32::from(is_srgb(planes[0].1)) | (u32::from(is_srgb(planes[1].1)) << 1);
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    scene_fmt = planes[0].1.0,
+                    over_fmt = planes[1].1.0,
+                    srgb_flags = flags,
+                    "two-plane composer active"
+                );
+            });
             let rtv = host.rtv(Some(back), None);
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.SetDescriptorHeaps(&[Some(views.clone())]);
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
-            list.SetGraphicsRootDescriptorTable(0, gpu);
+            list.SetGraphicsRoot32BitConstant(0, flags, 0);
+            list.SetGraphicsRootDescriptorTable(1, gpu);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
@@ -389,5 +444,18 @@ mod tests {
             }
             eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+
+    #[test]
+    fn composer_shader_compiles_on_host_device() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        Composer::new(host, DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
     }
 }

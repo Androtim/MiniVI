@@ -180,10 +180,10 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
-    // The title may pass MEM_RESERVE_PLACEHOLDER directly, without the
-    // console's PAGES_64K bits. Track the actual reservation made above so
-    // arrange can give either form consecutive physical-page slices.
-    if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 && constrained && flags & ADDRESS_32BIT != 0 {
+    // The title may reserve its 32-bit graphics heap without `PAGES_64K`.
+    // Track any unconstrained or placeholder 32-bit reservation so `arrange`
+    // can give either form consecutive physical-page slices.
+    if !at.is_null() && (kind & MEM_RESERVE_PLACEHOLDER != 0 || kind & MEM_COMMIT == 0) && constrained && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     if !at.is_null() && placeholder {

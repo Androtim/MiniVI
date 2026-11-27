@@ -63,10 +63,31 @@ pub(crate) struct Pending {
     first_wait: AtomicU64,
 }
 
+fn bytes_contain(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .any(|s| s.stage == "compute" && bytes_contain(&s.container, name))
+}
+
+fn is_rt_skin_bytes(bytes: &[u8]) -> bool {
+    bytes_contain(bytes, b"CSComputeSkinning") || bytes_contain(bytes, b"CSGenerateHairVB")
+}
+
+fn is_rt_trace_bytes(bytes: &[u8]) -> bool {
+    (bytes_contain(bytes, b"CS_ScreenProbes_TraceRays") && bytes_contain(bytes, b"_BVH"))
+        || (bytes_contain(bytes, b"CS_RaytraceVBuffer") && !bytes_contain(bytes, b"Voxels"))
+}
+
+fn bvh_miss_no_builder() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+    })
 }
 
 /// Tiled water volume lighting compute shaders (64-lane waves) that on 32-lane
@@ -124,6 +145,20 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
             "skipping tiled water light on 32-lane host (set VICTORY_WATER_LIGHT=1 to enable)"
         );
         return Some("water light skipped on 32-lane host (VICTORY_WATER_LIGHT=1)");
+    }
+    static SKIP_RT_SKIN: OnceLock<bool> = OnceLock::new();
+    let skip_skin = *SKIP_RT_SKIN.get_or_init(|| {
+        bvh_miss_no_builder() && std::env::var_os("VICTORY_RT_SKIN").is_none_or(|v| v != "1")
+    });
+    if skip_skin && shaders.iter().any(|s| s.stage == "compute" && is_rt_skin_bytes(&s.container)) {
+        return Some("ray-tracing skinning without BVH, left out");
+    }
+    static SKIP_RT_TRACE: OnceLock<bool> = OnceLock::new();
+    let skip_trace = *SKIP_RT_TRACE.get_or_init(|| {
+        bvh_miss_no_builder() && std::env::var_os("VICTORY_RT_TRACE").is_none_or(|v| v != "1")
+    });
+    if skip_trace && shaders.iter().any(|s| s.stage == "compute" && is_rt_trace_bytes(&s.container)) {
+        return Some("BVH ray-trace without BVH, left out");
     }
     None
 }
@@ -910,5 +945,19 @@ mod tests {
             assert!(!water_light_hash_skipped(hash, 64, false));
         }
         assert!(!water_light_hash_skipped("0123456789abcdef", 32, false));
+    }
+
+    #[test]
+    fn rt_only_skin_and_trace_programs_are_known_by_name() {
+        assert!(is_rt_skin_bytes(b"..\0CSComputeSkinningRigidVelocity_1c34db0a_Wrapped\0.."));
+        assert!(is_rt_skin_bytes(b"..\0CSGenerateHairVB_c88a8f19_Wrapped\0.."));
+        assert!(!is_rt_skin_bytes(b"..\0CS_PedStandardSkinning_3_00aa11bb_Wrapped\0.."));
+        assert!(!is_rt_skin_bytes(b"computeclothSkinning"));
+
+        assert!(is_rt_trace_bytes(b"..\0CS_ScreenProbes_TraceRays_RayBinning_BVH_Mixed\0.."));
+        assert!(is_rt_trace_bytes(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."));
+        assert!(!is_rt_trace_bytes(b"..\0CS_ScreenProbes_TraceRays_Voxels\0.."));
+        assert!(!is_rt_trace_bytes(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."));
+        assert!(!is_rt_trace_bytes(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."));
     }
 }

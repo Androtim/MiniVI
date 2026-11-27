@@ -10,7 +10,7 @@
 
 ### Upstream Base (`DoubleGhosty/cool_fox`)
 - **Multi-GPU & Multi-OS Compatibility:** Supports NVIDIA GeForce and AMD Radeon, Windows 11, Windows 10 (`--features agility-sdk` with `scripts\get-agility-sdk.ps1`), and Wine/Proton.
-- **Renderer Ports & Frame Pacing:** `VICTORY_PORT_GUARD=1` and `VICTORY_PORT_JOURNAL=1` save ~2–5 ms/frame on all GPUs (`VICTORY_PORT_CONSTANTS=1` + `VICTORY_PORT_CBV=1` available for AMD 16 GB+ cards), alongside uncapped 60/120 FPS pacing (`VICTORY_FRAME_INTERVAL_MS`), bindless root-signature probing, render-target bind caching, and Pareto host-memory residency guards.
+- **Renderer Ports & Frame Pacing:** `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`, and `VICTORY_PORT_CONSTANTS=1` keep 32-bit graphics heaps & constant descriptors fast on all GPUs (`VICTORY_PORT_CBV=1` available for AMD 16 GB+ cards), alongside `VICTORY_RT_NO_ARENAS=1` (zero-VRAM No-RT fast path), uncapped 60/120 FPS pacing (`VICTORY_FRAME_INTERVAL_MS`), bindless root-signature probing, render-target bind caching, and Pareto host-memory residency guards.
 - **Latest Shader & Lighting Upgrades:** Wave-wide branch EXEC preservation, Wave32 face-relocation & cascade lowering, blendshape initialization ordering, air/march in-scatter clamps (`VICTORY_AMBIENT_MARCH`), time-settled ambient estimation (`VICTORY_AMBIENT_SETTLE`), NaN/Inf froxel cleanup, and automatic idle RT resolve skipping when BVH is disabled.
 
 ### MiniVI 8 GB VRAM & 32 GB RAM Layer (Iteration 5)
