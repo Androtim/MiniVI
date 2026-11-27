@@ -5,8 +5,10 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+static HOST_IS_AMD: AtomicBool = AtomicBool::new(false);
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -939,6 +941,7 @@ fn create() -> windows::core::Result<Host> {
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
+            HOST_IS_AMD.store(amd, Ordering::Relaxed);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
         let messages = debug
@@ -3043,7 +3046,17 @@ pub(crate) fn late_free_present() -> bool {
 /// title bytes the card had received when it ran.
 pub(crate) fn relay() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
+    *ON.get_or_init(|| {
+        if late_stage() == 0 || !crate::shadow::relay() {
+            return false;
+        }
+        let explicit = std::env::var_os("VICTORY_RELAY").is_some();
+        if !explicit && HOST_IS_AMD.load(Ordering::Relaxed) {
+            tracing::info!("relay off by default on AMD (set VICTORY_RELAY=2 to override)");
+            return false;
+        }
+        true
+    })
 }
 
 /// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
