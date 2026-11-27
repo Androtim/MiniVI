@@ -2544,7 +2544,8 @@ impl State {
                         );
                     }
                     BAKE_SERVED.store(0, Ordering::Relaxed);
-                    PASS_BUDGET.set(Some((left, 2 << 30, true)));
+                    let bake_cap = if crate::residency::limited_host_ram() { 128 << 20 } else { 2 << 30 };
+                    PASS_BUDGET.set(Some((left, bake_cap, true)));
                     served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
                     PASS_BUDGET.set(None);
                 }
@@ -2583,7 +2584,8 @@ impl State {
                 }
             }
             EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed);
-            PASS_BUDGET.set(Some((left, 2 << 30, true)));
+            let bake_cap = if crate::residency::limited_host_ram() { 128 << 20 } else { 2 << 30 };
+            PASS_BUDGET.set(Some((left, bake_cap, true)));
             crate::texture::BAKING.set(exact);
             let _ = self.heap_textures(list, heap, host, None);
             crate::texture::BAKING.set(false);

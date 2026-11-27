@@ -87,6 +87,37 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
 
+/// What a piece given back waits for besides [`REST`]: every submission
+/// begun or queued when it came back has finished, [`crate::host::bury_lag`]
+/// more after them, and [`SETTLE`] ms. `VICTORY_POOL_FENCED=0`: [`REST`]
+/// alone, as before.
+#[derive(Clone, Copy)]
+struct Resting {
+    at: u64,
+    begun: u64,
+}
+
+/// Milliseconds a piece given back rests at least ([`Resting`]).
+const SETTLE: u64 = 100;
+
+impl Resting {
+    fn now(at: u64) -> Resting {
+        Resting { at, begun: crate::host::submissions().0 + crate::queue::queued() }
+    }
+
+    fn over(self, now: u64, finished: u64) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_FENCED").is_none_or(|v| v != "0"));
+        self.over_with(now, finished, crate::host::bury_lag(), enabled)
+    }
+
+    fn over_with(self, now: u64, finished: u64, lag: u64, enabled: bool) -> bool {
+        // (Before any submission there is nothing to wait for, and
+        // nothing to tell the timer from: it decides.)
+        enabled && self.begun > 0 && now >= self.at + SETTLE && finished.saturating_sub(lag) >= self.begun
+    }
+}
+
 fn now() -> u64 {
     crate::host::now_ms()
 }
@@ -227,8 +258,10 @@ struct Block<B> {
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
-    /// Pieces given back, and when each may be used again.
-    resting: VecDeque<(u64, Piece)>,
+    /// Pieces given back: when each may be used again at the latest, the
+    /// submissions begun (and queued) when it came back ([`Resting`]), and
+    /// the piece.
+    resting: VecDeque<(u64, Resting, Piece)>,
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
@@ -333,7 +366,7 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + REST, Resting::now(now), piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -344,8 +377,9 @@ impl<B: Clone> Pool<B> {
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
-        while let Some(&(ready, piece)) = self.resting.front()
-            && ready <= now
+        let finished = crate::host::submissions().1;
+        while let Some(&(ready, resting, piece)) = self.resting.front()
+            && (ready <= now || resting.over(now, finished))
         {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
@@ -629,6 +663,16 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn fenced_resting_waits_for_settle_and_bury_lag() {
+        let r = Resting { at: 1000, begun: 50 };
+        assert!(!r.over_with(1000 + SETTLE, 50 + 16, 16, false));
+        assert!(!Resting { at: 1000, begun: 0 }.over_with(1000 + SETTLE, 100, 16, true));
+        assert!(!r.over_with(1000 + SETTLE - 1, 50 + 16, 16, true));
+        assert!(!r.over_with(1000 + SETTLE, 50 + 15, 16, true));
+        assert!(r.over_with(1000 + SETTLE, 50 + 16, 16, true));
     }
 
     #[test]

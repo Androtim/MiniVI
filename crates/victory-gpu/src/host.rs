@@ -94,6 +94,38 @@ enum Retired {
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
+/// The card's budget we plan with, from the system's: `VICTORY_CARD_BUDGET_MB`
+/// if set (at most the system's), else under Wine the system's less 1 GiB.
+/// On Windows the system moves what does not fit to the PC's memory; on
+/// Linux nothing does, and what the desktop asks for next is refused.
+pub(crate) fn planned_card_budget(system: u64) -> u64 {
+    static ASKED: OnceLock<Option<u64>> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb << 20)
+    });
+    match asked {
+        Some(budget) => budget.min(system),
+        None if under_wine() => system.saturating_sub(1 << 30),
+        None => system,
+    }
+}
+
+/// Whether we run under Wine or Proton (its ntdll exports `wine_get_version`).
+pub fn under_wine() -> bool {
+    static WINE: OnceLock<bool> = OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 /// Milliseconds since the first call.
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -499,7 +531,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// were page faults in memory nothing of ours named any more, at no command
 /// in particular. Objects let go while nothing runs wait as well: lists
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
-fn bury_lag() -> u64 {
+pub(crate) fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
         let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
@@ -10555,7 +10587,7 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        Some([planned_card_budget(own.Budget), own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
     /// Both of the system's memory groups for this process, in bytes: for

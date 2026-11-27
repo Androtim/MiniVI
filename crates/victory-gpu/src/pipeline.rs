@@ -241,6 +241,7 @@ impl Shader {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
+                        names = ?container_names(&self.container),
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         "shader translated"
@@ -547,7 +548,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 #[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
-        .split(',')
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
@@ -566,14 +567,25 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 
 #[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let mut list: std::collections::HashSet<String> = parse_skip_hashes(&value).into_iter().collect();
+        for var in ["VICTORY_SKIP_PIPELINES_FILE", "VICTORY_DENY_PIPELINES_FILE"] {
+            if let Some(path) = std::env::var_os(var)
+                && let Ok(content) = std::fs::read_to_string(path)
+            {
+                list.extend(parse_skip_hashes(&content));
+            }
+        }
+        if !list.is_empty() {
+            tracing::info!(skipped_pipelines = list.len(), "pipelines skipped from VICTORY_SKIP_PIPELINES / _FILE");
+        }
+        list
     });
     p.shaders
         .iter()
-        .find(|shader| shader.hair || !hashes.is_empty() && hashes.contains(&shader.hash))
+        .find(|shader| shader.hair || (!hashes.is_empty() && hashes.contains(&shader.hash)))
         .map(|shader| shader.hash.as_str())
 }
 
@@ -862,6 +874,25 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// The names a title's shader container carries (`CS_..._1234abcd`), for the
+/// log: printable runs of a stage prefix, an underscore and more.
+pub(crate) fn container_names(container: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    for run in container.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')) {
+        if run.len() >= 6
+            && run.len() <= 96
+            && run[2] == b'_'
+            && matches!(&run[..2], b"CS" | b"PS" | b"VS" | b"MS" | b"AS" | b"GS" | b"HS" | b"DS")
+        {
+            let name = String::from_utf8_lossy(run).into_owned();
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -882,6 +913,10 @@ mod tests {
         assert!(super::parse_skip_hashes(" , ").is_empty());
         assert_eq!(
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            ["0123456789abcdef", "0011223344556677"]
+        );
+        assert_eq!(
+            super::parse_skip_hashes("0123456789ABCDEF\n  0011223344556677\r\n"),
             ["0123456789abcdef", "0011223344556677"]
         );
     }
