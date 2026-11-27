@@ -92,6 +92,39 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// Whether helper threads the submitting thread waits for run at above-normal
+/// priority (`VICTORY_HELPER_PRIORITY`, on by default).
+fn helpers_raised() -> bool {
+    crate::toggled!("VICTORY_HELPER_PRIORITY")
+}
+
+/// Keeps a helper thread's Windows priority aligned with [`helpers_raised`].
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,6 +24,10 @@ Most recent compatibility forks target 12–24 GB VRAM GPUs and 64 GB RAM workst
 - **Texture Retry, Pooled Readbacks & Safety Hardening (Iteration 4C):**
   - **Retry out-of-room textures (`#3198`):** temporary `E_OUTOFMEMORY` texture failures wait `1000` ms and retry on later draws instead of permanently turning textures black.
   - **Bounded texture readback reuse & ticket refresh (`#1376`, `VICTORY_READBACK_POOL=1` / `VICTORY_READBACK_POOL_MB=64`):** re-registers texture readback tickets when memory is reused, reuses retired readback buffers across closed command lists, forgets released view heaps' RT address runs (`#589`), rejects removed-device fence waits in background workers (`#1366`), and fixes embedded DXBC byte extents during offline shader pre-warming.
+- **Texture Decode, Raw View Clamp & Helper Thread Priority (Iteration 4D):**
+  - **BC7 rotation field fix (`victory-formats`):** applies BC7 channel rotation only to modes `4` and `5`, preventing corrupted blocks and shift panics on modes `0–3`, `6`, and `7`.
+  - **Raw buffer view clamping (`VICTORY_RAW_VIEW_CLAMP=0` restores unclamped):** bounds dynamic raw SRVs and UAVs to the host buffer's byte width and turns unaligned or out-of-range views into null views.
+  - **Helper thread priority boost (`VICTORY_HELPER_PRIORITY=0` disables):** keeps background refresh, heap-sync, and landing workers at above-normal priority alongside the submit thread.
 - **NVIDIA & Visual Quality Base:** builds on `VIctory-NVIDIA` (Series S two-plane UI compose, `VICTORY_DYNAMIC_SLOTS=524288`, `VICTORY_BVH_MISS=1`, `VICTORY_OWN_UPSCALER=1`, `VICTORY_RENDER_SCALE`, `VICTORY_NAN_SCRUB=1`, and RT resolve skip list).
 - **Wave 1 Visual & FPS Fixes (`fxceless` upstream ports):**
   - **Min-LOD Preservation (`#1210`):** keeps `ResourceMinLODClamp` intact when shifting `MostDetailedMip` on streamed texture views so partially resident textures stay sharp.
@@ -98,6 +102,8 @@ Double-clickable wrappers are also in `scripts/`:
 | `VICTORY_CENSUS=1` | off | Logs buffer-copy census counters every `VICTORY_CENSUS_SECONDS` seconds (`diag`/logging). |
 | `VICTORY_BAKE_SOURCES` / `_MB` | `1` / `1024` | Pre-uploads decoration bake source textures before bake draws (`VICTORY_BAKE_SOURCES_MB=512` in non-540p presets). |
 | `VICTORY_READBACK_POOL` / `_MB` | off / `256` MiB | Reuses retired automatic texture readback buffers within a capped idle pool (`1` / `64` MiB in presets). |
+| `VICTORY_RAW_VIEW_CLAMP` | on (`1`) | Clamps dynamic raw buffer views to host buffer bounds (`0` restores unclamped views). |
+| `VICTORY_HELPER_PRIORITY` | on (`1`) | Runs helper workers at above-normal Windows thread priority alongside the submit thread (`0` reverts to normal). |
 | `VICTORY_PANEL` | off (`F3` toggles) | Shows the live FPS, draws, RAM, and VRAM overlay in both `diag` and `release` builds. |
 | `VICTORY_WATER_LIGHT` | auto (off on 32-lane) | Re-enables the two 64-lane tiled water-light compute shaders on 32-lane hosts (`1` forces them on; default skips them to avoid dark water blocks). |
 | `VICTORY_BVH_FAULTS_ALL` | `2048` | Maximum RT address-indexed fault pages mapped (`8192` in `play-minivi.ps1 -RayTracing`). |
@@ -136,6 +142,7 @@ Double-clickable wrappers are also in `scripts/`:
     - **720p Bench (`n=305`, 28.5 min continuous):** **`9.7` FPS median / `9.7` avg** (`9.4` med dense), **`5,807 MB` avg / `6,211 MB` peak VRAM (`0/336` `room=false`)**, **`21.4 GB` avg / `26.0 GB` peak RAM**, ending with a captured DRED `0x887A0006` device-hung TDR at `6,932` draws and `45,143` card buffer compares during fast driving (targeted by Iteration 4C parallel card hashing).
   - **Iteration 4B:** enables the F3 stats overlay in all builds, skips 64-lane water-light shaders by default on 32-lane hosts, adds `VICTORY_BVH_FAULTS_ALL` (`8192` in `-RayTracing`) + `VICTORY_AMBIENT_RT` (`0.5,2.0,0.8`), unlocks lock-free command signature creation (`#1393`), raises bake source budget to `512` MiB, and defaults `relay()` off on AMD (`-Amd` switch) without modifying `crates/victory-shader/` (keeping both pre-warmed shader caches valid).
   - **Iteration 4C:** retries temporarily out-of-room textures (`#3198`), adds bounded texture readback buffer pooling (`VICTORY_READBACK_POOL=1`, `64` MiB in presets) and stale ticket re-registration (`#1376`), cleans up released heap RT address runs (`#589`), catches removed devices in background fence waits (`#1366`), and fixes offline embedded DXBC extent hashing — still with zero `crates/victory-shader/` edits.
+  - **Iteration 4D:** fixes BC7 channel rotation on non-rotation modes (`0–3`, `6–7`), clamps dynamic raw buffer views inside host buffers (`VICTORY_RAW_VIEW_CLAMP`), and boosts submit-helper thread priorities (`VICTORY_HELPER_PRIORITY`) — zero `crates/victory-shader/` edits.
 
 ### Open Caveats / Blockers
 - **Dark interiors & night shadows:** RT GI resolve passes are skipped via `scripts/rt_off_hashes.txt` by default, leaving low-light scenes dim under ambient stand-in values; real RT is testable via `play-minivi.ps1 -RayTracing`.
