@@ -873,8 +873,11 @@ impl Module {
                 V::Const(i) => funcs + i,
                 V::Inst(i) => {
                     let id = ids[i as usize];
-                    assert_ne!(id, u32::MAX, "use of a void value");
-                    id
+                    if id == u32::MAX {
+                        funcs.saturating_sub(1)
+                    } else {
+                        id
+                    }
                 }
             }
         };
