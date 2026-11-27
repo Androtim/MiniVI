@@ -1322,6 +1322,59 @@ pub(crate) fn held_only() -> bool {
     })
 }
 
+/// Top levels left out of host copies of placed textures the title fills
+/// (`VICTORY_TEXTURE_MIP_DROP=0..3`, `0` if unset: none). A copy starts at that
+/// level, views below it show it (`descriptor::host::from_base`), uploads read from it.
+#[cfg(windows)]
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        let drop = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(3);
+        if drop > 0 {
+            tracing::info!(
+                mip_drop = drop,
+                min_size = mip_drop_min_size(),
+                levels_on_demand = crate::tiles::wanted(),
+                held_levels = held_only(),
+                "texture mip drop: host copies of placed textures start that many levels down"
+            );
+        }
+        drop
+    })
+}
+
+/// Width and height a texture needs for [`texture_mip_drop`]
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default `1024`).
+#[cfg(windows)]
+fn mip_drop_min_size() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1024)
+    })
+}
+
+/// First level of a host copy of `desc` under [`texture_mip_drop`]: `0` under
+/// the minimum size, at least two levels kept, and valid for [`base_level`].
+#[cfg(windows)]
+fn mip_drop_base(desc: &ResourceDesc) -> u32 {
+    mip_drop_base_with(desc, texture_mip_drop(), mip_drop_min_size())
+}
+
+#[cfg(windows)]
+fn mip_drop_base_with(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    if drop == 0 || desc.width < min_size || u64::from(desc.height) < min_size {
+        return 0;
+    }
+    base_level(desc, drop.min(u32::from(desc.mip_levels).saturating_sub(2)))
+}
+
 /// The first level a placed texture's view shows: of views of one 2D
 /// texture (the others show whole textures). After victory-amd 4436f8f1.
 pub(crate) fn first_mip(view: &[u32]) -> u32 {
@@ -1419,7 +1472,7 @@ pub(crate) static HELD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::
 #[cfg(windows)]
 pub(crate) fn want_level(this: This, first: u32) {
     use std::sync::atomic::Ordering::Relaxed;
-    if this.is_null() || !held_only() {
+    if this.is_null() || !(held_only() || texture_mip_drop() > 0) {
         return;
     }
     let r = resource(this);
@@ -1431,7 +1484,7 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(mip_drop_base(&r.desc)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1678,7 +1731,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        let all = crate::tiles::all();
+        // `VICTORY_TEXTURE_MIP_DROP` ([`mip_drop_base`]): the host copy
+        // starts that many levels down instead of level-by-level tiling.
+        let dropped = if shape_fits && r.host.placed.load(Relaxed) && alias_of(this).is_none() {
+            mip_drop_base(&r.desc)
+        } else {
+            0
+        };
+        if shape_fits
+            && r.host.placed.load(Relaxed)
+            && crate::tiles::wanted()
+            && dropped == 0
+            && (!all || alias_of(this).is_none())
+        {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1686,7 +1752,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
             let partly = readable
                 && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                && (all
+                    || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
@@ -1701,15 +1768,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
-        // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
-        let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        // The levels views show ([`held_only`]), combined with any
+        // `VICTORY_TEXTURE_MIP_DROP` floor.
+        let mut base = dropped;
+        if shape_fits && r.host.placed.load(Relaxed) && (held_only() || dropped > 0) && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             if first != u32::MAX {
-                base = base_level(&r.desc, first);
+                base = base.max(base_level(&r.desc, first));
             }
         }
         let texture = match texture {
@@ -1824,7 +1891,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept(Some(budget))
                 < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
@@ -1858,16 +1927,32 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// (2026-11-26 diag run 16:28, 10:59:54: 8,722 MB in use + 836 MB kept
 /// for targets against a line of 9,527 MB). The reserve comes back when
 /// the targets grow by 64 MiB again (a new scene's), for as long again.
+/// Pure calculation of reserved render-target headroom for [`targets_room_kept`].
+/// Defaults to 3,072 MiB on >=12 GiB cards, scaled to at most `budget / 4`
+/// on cards with `<= 9 GiB` VRAM unless `VICTORY_CARD_ROOM_FOR_TARGETS_MB` is set.
+#[cfg(any(windows, test))]
+fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Option<u64>) -> u64 {
+    const DEFAULT_MOST: u64 = 3072 << 20;
+    const SMALL_BUDGET_CEILING: u64 = 9 << 30;
+    if let Some(mb) = override_mb {
+        return mb.min(8192) << 20;
+    }
+    match vram_budget {
+        Some(budget) if budget <= SMALL_BUDGET_CEILING => DEFAULT_MOST.min(budget / 4),
+        _ => DEFAULT_MOST,
+    }
+}
+
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
+    let most = targets_room_kept_bytes(vram_budget, override_mb);
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let settle = *SETTLE.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS")
@@ -1933,7 +2018,7 @@ pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
             used,
             crate::pool::texture_room(),
             crate::shadow::card_room_kept(),
-            targets_room_kept(),
+            targets_room_kept(Some(budget)),
             room_line(budget),
         ]
         .map(|bytes| bytes >> 20),
@@ -2270,7 +2355,7 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept(Some(budget));
             crate::host::vram_keep_below(budget, used, room_line(budget))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -4880,5 +4965,34 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn targets_room_kept_scales_on_8gb_cards() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(targets_room_kept_bytes(None, None), 3072 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(6 * GIB), None), 1536 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(8 * GIB), None), 2048 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(12 * GIB), None), 3072 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(16 * GIB), None), 3072 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(24 * GIB), None), 3072 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(8 * GIB), Some(1024)), 1024 * MIB);
+        assert_eq!(targets_room_kept_bytes(Some(8 * GIB), Some(0)), 0);
+        assert_eq!(targets_room_kept_bytes(Some(24 * GIB), Some(10_000)), 8192 * MIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mip_drop_starts_a_copy_further_down() {
+        let words = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        // SAFETY: 56 bytes matching `ResourceDesc`'s repr(C) layout.
+        let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        assert_eq!(mip_drop_base_with(&desc, 2, 256), 2);
+        assert_eq!(mip_drop_base_with(&desc, 0, 256), 0);
+        assert_eq!(mip_drop_base_with(&desc, 2, 1024), 0, "under the minimum size");
+        let mut two = desc;
+        two.mip_levels = 2;
+        assert_eq!(mip_drop_base_with(&two, 2, 256), 0, "at least two levels are kept");
     }
 }

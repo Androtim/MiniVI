@@ -306,8 +306,37 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// profile cpu-1), and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// `VICTORY_LIST_IDLE_MOST=N` (or `VICTORY_LIST_POOL_MOST=N`): N instead of 512,
+/// from 16 to 4096.
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let set = std::env::var("VICTORY_LIST_IDLE_MOST")
+            .ok()
+            .or_else(|| std::env::var("VICTORY_LIST_POOL_MOST").ok())
+            .and_then(|v| v.trim().parse().ok());
+        set.map_or(IDLE_MOST.0, |n: usize| n.clamp(16, 4096))
+    })
+}
+
+/// Immediately drops excess idle host lists down to 64 under host RAM pressure.
+#[cfg(windows)]
+pub(crate) fn trim_on_pressure() {
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let excess = idle.0.len().saturating_sub(64);
+        if excess > 0 {
+            dropped = idle.0.drain(..excess).collect();
+            idle.1 -= dropped.iter().map(|Idle(_, b)| b).sum::<u64>();
+        }
+    }
+    drop(dropped);
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -348,7 +377,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most() {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -356,7 +385,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most() && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

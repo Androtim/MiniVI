@@ -1720,7 +1720,14 @@ impl Staging {
             let judged = self.judgement();
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
-            let held = self.held_levels(judged);
+            let held = crate::tiles::cap_levels(
+                self.held_levels(judged),
+                u64::from(self.layout.desc.width),
+                self.layout.desc.height,
+                self.layout.mips.len(),
+                self.layout.first_tail_mip as usize,
+                crate::tiles::max_dim(),
+            );
             self.detiled.store(held, Relaxed);
             held
         } else {

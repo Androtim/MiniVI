@@ -84,7 +84,7 @@ const PAGE: u64 = 1 << 16;
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
 const PIECE: usize = 4096;
-/// Pages held, at most (3 GiB).
+/// Pages held, at most (3 GiB on > 9 GiB GPUs).
 const MOST: usize = 3 << 14;
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
@@ -92,8 +92,63 @@ const WINDOWS: usize = 512;
 const PACKED: u64 = 64 << 20;
 /// For so many frames what a page holds may still be on its way.
 const YOUNG: u64 = 4;
-/// Free pages there are, at least, when a list is recorded.
+/// Free pages there are, at least, when a list is recorded on > 9 GiB GPUs.
 const SPARE: usize = 1024;
+
+/// Maximum resident address-indexed RT/BVH pages for `vram_budget` and
+/// optional `VICTORY_RT_MEMORY_MB` override (clamped to `256..=3072` MiB).
+fn most_pages_for(vram_budget: Option<u64>, override_mb: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    const PAGES_PER_MIB: u64 = (1 << 20) / PAGE;
+    if let Some(mb) = override_mb {
+        return (mb.clamp(256, 3072) * PAGES_PER_MIB) as usize;
+    }
+    match vram_budget {
+        Some(budget) if budget <= 6 * GIB => (512 * PAGES_PER_MIB) as usize,
+        Some(budget) if budget <= 9 * GIB => (1024 * PAGES_PER_MIB) as usize,
+        _ => MOST,
+    }
+}
+
+/// Minimum spare address-indexed pages kept ahead when building BVHs.
+fn spare_pages_for(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match vram_budget {
+        Some(budget) if budget <= 9 * GIB => 256,
+        _ => SPARE,
+    }
+}
+
+fn most_pages() -> usize {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
+        std::env::var("VICTORY_RT_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if override_mb.is_some() {
+        return most_pages_for(None, override_mb);
+    }
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&pages) = PAGES.get() {
+        return pages;
+    }
+    let Some([budget, ..]) = host().and_then(|h| h.video_memory()) else {
+        return MOST;
+    };
+    *PAGES.get_or_init(|| most_pages_for(Some(budget), None))
+}
+
+fn spare_pages() -> usize {
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&pages) = PAGES.get() {
+        return pages;
+    }
+    let Some([budget, ..]) = host().and_then(|h| h.video_memory()) else {
+        return SPARE;
+    };
+    *PAGES.get_or_init(|| spare_pages_for(Some(budget)))
+}
 /// A packed structure not named for so many frames is another one.
 const AGAIN: u64 = 8;
 /// From a root view; from one that is written (a structure being built).
@@ -106,6 +161,19 @@ const BACK: u64 = 256 << 10;
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+
+/// Pages taken from the faults in all (`VICTORY_BVH_FAULTS_ALL=<n>`; unset:
+/// [`FAULTS_ALL`]). With ray tracing the default bound is met early and
+/// subsequent faulted pages stay unmapped for the rest of the run.
+fn faults_all() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BVH_FAULTS_ALL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(FAULTS_ALL)
+    })
+}
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -203,6 +271,10 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Pages found without a copy that were left so because of the bounds on
+    /// pages taken from faults, and the different pages faulted.
+    left: u64,
+    distinct: std::collections::HashSet<u64>,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -369,9 +441,10 @@ impl Memory {
             }
             return false;
         }
-        if self.pages.len() >= MOST {
+        let most = most_pages();
+        if self.pages.len() >= most {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            ONCE.call_once(|| tracing::warn!(most, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
         if let Some((copy, at)) = self.free.pop() {
@@ -675,14 +748,46 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let all = faults_all();
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
-                made += 1;
-                self.faulted += 1;
-                self.bring(page, page + 1);
+            self.stats.distinct.insert(page);
+            if self.copy_of(page).is_some() {
+                continue;
+            }
+            if made < FAULTS && self.faulted < all {
+                if self.map(page) {
+                    made += 1;
+                    self.faulted += 1;
+                    self.bring(page, page + 1);
+                }
+            } else {
+                self.stats.left += 1;
             }
         }
         self.stats.faults += pages.len() as u64;
+        static WHOLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if made < pages.len()
+            && self.faulted >= all
+            && WHOLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+        {
+            let mut text = String::new();
+            for &page in pages.iter().filter(|&&p| self.copy_of(p).is_none()) {
+                let at = page * PAGE;
+                let committed = crate::texture::committed(at as *const u8, PAGE as usize);
+                let buffer = crate::shadow::in_buffer(at, 1).is_some();
+                let packed = committed && self.packed_at(at).is_some();
+                text += &format!(
+                    " {at:#x}{}{}{}",
+                    if committed { "" } else { "?" },
+                    if buffer { "b" } else { "" },
+                    if packed { "p" } else { "" }
+                );
+            }
+            tracing::warn!(
+                frame = self.frame,
+                "title memory by address: pages left without a copy by the bounds (?: not committed, b: in a title buffer, p: a packed structure there):{text}"
+            );
+        }
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -765,7 +870,8 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; \
+             since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all)",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -787,7 +893,10 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            s.distinct.len(),
+            s.left as f64 / frames,
+            faults_all()
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -926,7 +1035,7 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free.len() < spare_pages() && m.pages.len() + m.free.len() < most_pages() && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1300,5 +1409,21 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn rt_memory_caps_scale_with_vram_and_override() {
+        const GIB: u64 = 1 << 30;
+        const PAGES_PER_MIB: usize = ((1 << 20) / PAGE) as usize;
+        assert_eq!(most_pages_for(Some(6 * GIB), None), 512 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(8 * GIB), None), 1024 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(16 * GIB), None), MOST);
+        assert_eq!(most_pages_for(None, None), MOST);
+        assert_eq!(most_pages_for(Some(8 * GIB), Some(1536)), 1536 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(8 * GIB), Some(64)), 256 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(16 * GIB), Some(8192)), 3072 * PAGES_PER_MIB);
+        assert_eq!(spare_pages_for(Some(8 * GIB)), 256);
+        assert_eq!(spare_pages_for(Some(16 * GIB)), SPARE);
+        assert_eq!(spare_pages_for(None), SPARE);
     }
 }
