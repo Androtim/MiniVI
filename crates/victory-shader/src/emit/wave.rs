@@ -375,6 +375,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             }
             continue;
         };
+        let f16_inline = name == "v_add_f16";
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -392,6 +393,13 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
+                // VOP_F16 encodes inline float constants (0.5..4.0, 1/(2*pi)) in 240..=248 instead of f32.
+                Operand::Const(c @ 240..=248) if f16_inline => {
+                    let h = [
+                        0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+                    ][usize::from(c - 240)];
+                    one(Sym::K(h))
+                }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
@@ -1287,6 +1295,77 @@ mod tests {
                 .collect();
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
+        }
+    }
+
+    #[test]
+    fn v_add_f16_inline_float_constants_decode_as_f16() {
+        let expected: &[(u16, u32)] = &[
+            (240, 0x3800), // 0.5
+            (241, 0xB800), // -0.5
+            (242, 0x3C00), // 1.0
+            (243, 0xBC00), // -1.0
+            (244, 0x4000), // 2.0
+            (245, 0xC000), // -2.0
+            (246, 0x4400), // 4.0
+            (247, 0xC400), // -4.0
+            (248, 0x3118), // 1 / (2 * pi)
+        ];
+        for &(c, h) in expected {
+            let mut w = vec![
+                sop1(0, 0x3D, 193),  // s_or_saveexec_b32 s0, -1
+                vop1(1, 0x01, 128),  // v_mov_b32 v1, 0
+                vop2(1, 0x32, c, 1), // v_add_f16 v1, c, v1
+            ];
+            w.extend(vop3(1, 0x360, 257, 128, 0)); // v_readlane_b32 s1, v1, 0
+            w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+            w.push(S_ENDPGM);
+            let p = build(&w, false);
+            let insts = &p.blocks[0].insts;
+            let v1_val = insts[2].write(Reg::V(1)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            assert_eq!(
+                sec.shapes.get(&v1_val),
+                Some(&Shape::K(h)),
+                "inline constant {c} should decode as f16 {h:#06x} in v_add_f16"
+            );
+        }
+
+        let reduce_with_extra = |src_const: u16| {
+            let mut w = vec![
+                sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+            ];
+            w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s0
+            w.push(vop2(1, 0x32, src_const, 1)); // v_add_f16 v1, src_const, v1
+            for ctrl in [0xB1u16, 0x4E, 0x141, 0x140] {
+                w.push(vop2(1, 0x32, 0xFA, 1));
+                w.push(dpp16(1, ctrl, 0xF, 0xF, false));
+            }
+            w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
+            w.push(vop2(1, 0x32, 258, 1)); // v_add_f16 v1, v2, v1
+            w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+            w.push(S_ENDPGM);
+            let p = build(&w, false);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(0)).unwrap();
+            let v0_in = p
+                .inputs
+                .iter()
+                .find_map(|&(r, v)| (r == Reg::V(0)).then_some(v))
+                .unwrap();
+            let v1_val = insts[insts.len() - 3].write(Reg::V(1)).unwrap();
+            let shape = sections(&p, 0)[&0].shapes.get(&v1_val).copied();
+            (shape, Shape::Active(Op::AddH, v0_in, saved, 0))
+        };
+
+        let (ident, expected_active) = reduce_with_extra(128);
+        assert_eq!(ident, Some(expected_active));
+        for c in 240..=248 {
+            let (shape, _) = reduce_with_extra(c);
+            assert_eq!(
+                shape, None,
+                "v_add_f16 with non-zero inline constant {c} must not be treated as a pure reduction"
+            );
         }
     }
 }
