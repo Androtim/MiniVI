@@ -566,14 +566,20 @@ def analyze_run(
             frame_metrics.append(info)
 
     if frame_metrics:
+        lit_frames = [f for f in frame_metrics if f["near_black_pct"] < 98.0]
+        black_transition_count = len(frame_metrics) - len(lit_frames)
+        scored_frames = lit_frames if lit_frames else frame_metrics
         visuals = {
             "world_png_count": len(frame_metrics),
-            "median_mean_luma": round(statistics.median(f["mean_luma"] for f in frame_metrics), 2),
+            "lit_png_count": len(lit_frames),
+            "black_transition_count": black_transition_count,
+            "all_median_mean_luma": round(statistics.median(f["mean_luma"] for f in frame_metrics), 2),
+            "median_mean_luma": round(statistics.median(f["mean_luma"] for f in scored_frames), 2),
             "best_mean_luma": max(f["mean_luma"] for f in frame_metrics),
-            "median_near_black_pct": round(statistics.median(f["near_black_pct"] for f in frame_metrics), 2),
-            "median_edge_energy": round(statistics.median(f["edge_energy"] for f in frame_metrics), 2),
+            "median_near_black_pct": round(statistics.median(f["near_black_pct"] for f in scored_frames), 2),
+            "median_edge_energy": round(statistics.median(f["edge_energy"] for f in scored_frames), 2),
             "best_edge_energy": max(f["edge_energy"] for f in frame_metrics),
-            "median_saturation": round(statistics.median(f["mean_saturation"] for f in frame_metrics), 3),
+            "median_saturation": round(statistics.median(f["mean_saturation"] for f in scored_frames), 3),
             "max_magenta_pct": max(f["magenta_pct"] for f in frame_metrics),
             "max_cyan_pct": max(f["cyan_pct"] for f in frame_metrics),
             "frames": frame_metrics,
@@ -581,6 +587,9 @@ def analyze_run(
     else:
         visuals = {
             "world_png_count": 0,
+            "lit_png_count": 0,
+            "black_transition_count": 0,
+            "all_median_mean_luma": 0.0,
             "median_mean_luma": 0.0,
             "best_mean_luma": 0.0,
             "median_near_black_pct": 100.0,
@@ -639,8 +648,10 @@ def analyze_run(
     )
 
     if not allow_no_frames:
+        min_lit = max(1, visuals["world_png_count"] // 4)
         vis_ok = (
             visuals["world_png_count"] >= 1
+            and visuals["lit_png_count"] >= min_lit
             and visuals["median_mean_luma"] >= 15.0
             and visuals["median_near_black_pct"] <= 70.0
             and visuals["median_edge_energy"] >= 6.0
@@ -649,9 +660,9 @@ def analyze_run(
         add_check(
             "Visual lighting & texture detail",
             vis_ok,
-            f"pngs={visuals['world_png_count']}, luma={visuals['median_mean_luma']}, "
-            f"near_black={visuals['median_near_black_pct']}%, edge_energy={visuals['median_edge_energy']}, "
-            f"magenta={visuals['max_magenta_pct']}%",
+            f"pngs={visuals['world_png_count']}, lit={visuals['lit_png_count']}/{visuals['world_png_count']}, "
+            f"luma={visuals['median_mean_luma']}, near_black={visuals['median_near_black_pct']}%, "
+            f"edge_energy={visuals['median_edge_energy']}, magenta={visuals['max_magenta_pct']}%",
         )
 
     ab_deltas: dict[str, Any] = {}

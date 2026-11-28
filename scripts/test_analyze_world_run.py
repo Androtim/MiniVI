@@ -29,7 +29,13 @@ def _write_rgb_png(path: pathlib.Path, w: int, h: int, rows: bytearray) -> None:
     path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
 
 
-def make_textured_world_png(path: pathlib.Path, dark: bool = False, flat: bool = False, magenta: bool = False) -> None:
+def make_textured_world_png(
+    path: pathlib.Path,
+    dark: bool = False,
+    pure_black: bool = False,
+    flat: bool = False,
+    magenta: bool = False,
+) -> None:
     w, h = 320, 180
     rows = bytearray()
     for y in range(h):
@@ -37,6 +43,8 @@ def make_textured_world_png(path: pathlib.Path, dark: bool = False, flat: bool =
         for x in range(w):
             if magenta:
                 r, g, b = 255, 0, 255
+            elif pure_black:
+                r, g, b = 0, 0, 0
             elif flat:
                 r, g, b = 90, 90, 90
             elif dark:
@@ -109,12 +117,13 @@ class AnalyzeWorldRunTests(unittest.TestCase):
             root = pathlib.Path(tmp)
             log = root / "err.log"
             log.write_text(HEALTHY_LOG, encoding="utf-8")
-            for mode in ("dark", "flat", "magenta"):
+            for mode in ("dark", "pure_black", "flat", "magenta"):
                 fdir = root / mode
                 fdir.mkdir()
                 make_textured_world_png(
                     fdir / "frame-206.png",
                     dark=(mode == "dark"),
+                    pure_black=(mode == "pure_black"),
                     flat=(mode == "flat"),
                     magenta=(mode == "magenta"),
                 )
@@ -122,6 +131,23 @@ class AnalyzeWorldRunTests(unittest.TestCase):
                 self.assertFalse(summary["ok"], f"{mode} frame should fail visual check")
                 failed = {c["name"] for c in summary["checks"] if not c["ok"]}
                 self.assertIn("Visual lighting & texture detail", failed)
+
+    def test_black_fade_transition_does_not_mask_lit_world_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            log = root / "err.log"
+            fdir = root / "frames"
+            fdir.mkdir()
+            log.write_text(HEALTHY_LOG, encoding="utf-8")
+            for idx in range(210, 214):
+                make_textured_world_png(fdir / f"frame-{idx}.png")
+            for idx in range(220, 224):
+                make_textured_world_png(fdir / f"frame-{idx}.png", pure_black=True)
+            summary = MOD.analyze_run(log, frames_dir=fdir)
+            self.assertTrue(summary["ok"], summary["checks"])
+            self.assertEqual(summary["visuals"]["world_png_count"], 8)
+            self.assertEqual(summary["visuals"]["lit_png_count"], 4)
+            self.assertEqual(summary["visuals"]["black_transition_count"], 4)
 
     def test_ab_comparison_catches_fps_vram_and_lighting_regressions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
