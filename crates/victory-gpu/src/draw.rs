@@ -560,6 +560,9 @@ pub(crate) struct State {
     recording: u64,
     /// See [`State::rebinds`].
     rebinds: [u64; 2],
+    /// The longest copy this list made of each table: its address in the
+    /// title's heap -> slots, first dynamic slot, the hash of its records.
+    fresh_longest: std::collections::HashMap<u64, (u32, u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 impl Drop for State {
@@ -590,6 +593,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
+        self.fresh_longest.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -1950,13 +1954,27 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        // A table two stages read through the same root parameter is one
+        // table: the first stage copies it as far as any of them reads, and
+        // the others find that copy ([`State::tables`]).
+        let mut reach: Few<(u8, u32), 16> = Few::default();
+        if p.stages.len() > 1 {
+            for stage in &p.stages {
+                for group in stage.translated().tables.groups.iter().filter(|g| g.has_cbv) {
+                    match reach.iter_mut().find(|r| r.0 == group.slot) {
+                        Some(r) => r.1 = r.1.max(group.max_dword),
+                        None => reach.push((group.slot, group.max_dword)),
+                    }
+                }
+            }
+        }
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &reach);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -4489,11 +4507,16 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// Once, whatever length it is read to: a copy is as long as any stage
+    /// of the pipeline reads the table (`reach`: root parameter, highest
+    /// dword), and a shorter reading of a table the list has a longer copy
+    /// of, with the title's records as they were, reads that copy.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        reach: &[(u8, u32)],
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -4552,7 +4575,15 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            // As far as this stage reads it, and as far as the pipeline's
+            // others do if that lies inside the heap too.
+            let own = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let wide = reach.iter().find(|r| r.0 == slot).map_or(own, |r| own.max(r.1 / 8 + 1));
+            let inside = |n: u32| {
+                n <= crate::descriptor::host::DYNAMIC
+                    && table.checked_add(u64::from(n - 1) * 32).and_then(|handle| heap.index(handle)).is_some()
+            };
+            let n = if wide > own && inside(wide) { wide } else { own };
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -4561,17 +4592,27 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                let mut h = RecordHash::default();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
-                }
-                (table, n, h.0)
-            };
+            let key = (table, n, records_hash(table, n));
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            // The title's own slots of this table, if the host has them.
+            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // A longer copy of this table made in this list, whose records
+            // are the title's still: its first `n` slots are this table.
+            // The same list holds them, so they live as long as this
+            // reading; its constants are copied at submission as the copy's.
+            if !self.fresh_tables.contains_key(&key)
+                && let Some(&(longest, first, hashed)) = self.fresh_longest.get(&table)
+                && longest > n
+                && records_hash(table, longest) == hashed
+            {
+                self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), told: [0; 3] });
+                if let Some(title) = title_first {
+                    for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                        host.slot_tabled(title + k);
+                    }
+                }
+            }
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -4587,12 +4628,29 @@ impl State {
                     made.push((slot, first * 32));
                     continue;
                 }
+                // A stage that did not make the copy tells of the textures
+                // it reads, once, as the maker did of its own (below): the
+                // copy was made for it too.
+                let tells = match known.told.iter().position(|&t| t == reader.0 || t == 0) {
+                    Some(i) if known.told[i] == 0 => {
+                        known.told[i] = reader.0;
+                        title_first
+                    }
+                    _ => None,
+                };
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        if let Some(title) = tells
+                            && crate::descriptor::host::is_texture_view(&view)
+                        {
+                            let k = u.table_offset_dwords / 8;
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                        }
                     }
                 }
                 for k in selected {
@@ -4632,17 +4690,20 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), told: [reader.0, 0, 0] });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
-            // The title's own slots of this table: what the draw reads of
-            // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            if !matches!(self.fresh_longest.get(&table), Some(&(longest, ..)) if longest > n) {
+                self.fresh_longest.insert(table, (n, first, key.2));
+            }
+            // The title's own slots of this table (`title_first`): what the draw
+            // reads of them it brings up to date here, in the dynamic slots.
             // They are such a table's, whatever they hold. (Of a big one,
             // which may lie over slots shaders pick by index, only the ones
-            // the shader names.)
+            // the shader names; of one made longer for another stage, also
+            // all this stage's own if those are few.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                for k in (0..n).filter(|&k| n <= 64 || (k < own && own <= 64) || group.entry(k).is_some()) {
                     host.slot_tabled(title + k);
                 }
             }
@@ -5609,6 +5670,9 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
+    /// The stages (their plans) that told of the textures they read through
+    /// it: the one that made it, and the first two others.
+    told: [usize; 3],
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
@@ -5639,6 +5703,18 @@ impl RecordHash {
         let first = fold(self.0 ^ words ^ 0x2d35_8dcc_aa6c_78a5, 0x8bb8_4b93_962e_acc9 ^ u64::from(c));
         self.0 = fold(first ^ 0x4b33_a62e_d433_d4a3, 0x4d5a_2da5_1de1_aa47 ^ self.0.rotate_left(23)) ^ first;
     }
+}
+
+/// The hash of the `n` records of the table at `table` in the title's heap
+/// (all `n` lie inside the heap).
+fn records_hash(table: u64, n: u32) -> u64 {
+    let mut h = RecordHash::default();
+    for k in 0..n {
+        let at = table + u64::from(k) * 32;
+        // SAFETY: a descriptor slot in title memory.
+        h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+    }
+    h.0
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
