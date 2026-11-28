@@ -3432,17 +3432,48 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The title address (low dword, bits from 32 up) of the buffer view
-    /// whose descriptor the scalar load at `site` reads from the start of
-    /// a table entry, as the host tells it when it binds (`shader.rs`
-    /// `USER_VIEW_ADDRESS`); none for anything else. (The console's
-    /// descriptor holds more in the second dword, the stride from bit 16
-    /// up; code that takes the address masks those away.)
+    /// The title address (low dword, bits from 32 up) of the buffer or
+    /// ray-tracing acceleration structure view whose descriptor the scalar load
+    /// at `site` reads either from the start of a table entry
+    /// ([`super::shader::USER_VIEW_ADDRESS`]) or from the view heap
+    /// ([`super::shader::SLOT_VIEW_ADDRESSES`]); none for anything else. (The
+    /// console's buffer descriptor holds more in the second dword, the stride
+    /// from bit 16 up; code that takes the address masks those away.)
     fn view_address(&mut self, site: Site) -> Option<(V, V)> {
-        use super::shader::USER_VIEW_ADDRESS;
+        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_VIEW_ADDRESS};
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
+        if a.offset % 32 != 0 {
+            return None;
+        }
+        if rp.root == RootType::ResourceHeap {
+            let slot = self.heap_index(site, 0, false).ok()?;
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+            let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+            self.s.m.tag(slot, Tag::Clamp);
+            let three = self.s.m.i32(3);
+            let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+            let h = self.s.root_srv_handle(SLOT_VIEW_ADDRESSES);
+            let iu = self.s.m.undef(i32t);
+            let both = self.s.m.i8(3);
+            let align = self.s.m.i32(4);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, byte, iu, both, align],
+            );
+            let lo = self.s.m.extract(c, r, 0);
+            let hi = self.s.m.extract(c, r, 1);
+            let lo = self.as_int(lo);
+            let hi = self.as_int(hi);
+            return Some((lo, hi));
+        }
+        if rp.root != RootType::Table || a.dynamic.is_some() {
             return None;
         }
         let dword = a.offset / 4;
