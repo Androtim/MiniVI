@@ -1070,7 +1070,7 @@ static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether a write fault opens a guarded block without the guards' lock
-/// (`VICTORY_FAULT_UNLOCKED=1`; off unless asked for, or flipped while the
+/// (`VICTORY_FAULT_UNLOCKED=0` turns it off; on by default, or flipped while the
 /// title runs by `VICTORY_AB`).
 ///
 /// Under the lock the title's threads waited for it more than they did
@@ -1087,16 +1087,16 @@ static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// (`VICTORY_OPEN_ONE_VIEW=0`) goes the locked way.
 fn unlocked() -> bool {
     #[cfg(test)]
-    if UNLOCKED_IN_TEST.get() {
-        return true;
+    if let Some(forced) = UNLOCKED_IN_TEST.get() {
+        return forced;
     }
-    crate::asked_for!("VICTORY_FAULT_UNLOCKED")
+    crate::toggled!("VICTORY_FAULT_UNLOCKED")
 }
 
 #[cfg(test)]
 thread_local! {
-    /// [`unlocked`], for this thread's faults.
-    static UNLOCKED_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`unlocked`], for this thread's faults (`None` follows [`crate::toggled!`]).
+    static UNLOCKED_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Diagnostics, since the last line: write faults opened under the lock,
@@ -4603,7 +4603,7 @@ mod tests {
     /// 2 and 0.)
     #[test]
     fn faults_that_take_no_lock_tell_the_same() {
-        UNLOCKED_IN_TEST.set(true);
+        UNLOCKED_IN_TEST.set(Some(true));
         a_write_through_another_view_is_reported_at_the_guarded_one();
         a_write_is_reported_at_every_checked_view();
         a_write_opens_the_view_it_goes_through();
@@ -4612,7 +4612,7 @@ mod tests {
         stores_and_copies_of_the_title_leave_the_guard();
         bits_go_at_every_view();
         a_page_of_many_views_is_guarded_one_view_at_a_time();
-        UNLOCKED_IN_TEST.set(false);
+        UNLOCKED_IN_TEST.set(None);
     }
 
     /// A fault that takes no lock opens the view it came through, and tells
@@ -4628,10 +4628,10 @@ mod tests {
             assert!(writes(view, view + BLOCK, true).is_some());
         }
         assert!(published(one, one + BLOCK) && published(two, two + BLOCK));
-        UNLOCKED_IN_TEST.set(true);
+        UNLOCKED_IN_TEST.set(Some(true));
         // SAFETY: a view, opened by the handler.
         unsafe { ((two + 8) as *mut u8).write(1) };
-        UNLOCKED_IN_TEST.set(false);
+        UNLOCKED_IN_TEST.set(None);
         assert!(writable(two) && !writable(one));
         assert!(!published(one, one + BLOCK) && !published(two, two + BLOCK));
         {
@@ -4710,7 +4710,7 @@ mod tests {
             for t in 0..THREADS {
                 let barrier = &barrier;
                 s.spawn(move || {
-                    UNLOCKED_IN_TEST.set(t % 4 != 3);
+                    UNLOCKED_IN_TEST.set(Some(t % 4 != 3));
                     for round in 0..ROUNDS {
                         barrier.wait();
                         let view = if (round + t) % 3 == 0 { two } else { one };
@@ -4739,6 +4739,24 @@ mod tests {
         });
         assert_eq!(missed, None);
         drop_views(section, &[one, two], 2 * BLOCK);
+    }
+
+    #[test]
+    fn fault_unlocked_defaults_on_and_respects_test_override() {
+        struct Restore(Option<bool>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                UNLOCKED_IN_TEST.set(self.0);
+            }
+        }
+        assert_eq!(UNLOCKED_IN_TEST.get(), None);
+        if std::env::var_os("VICTORY_FAULT_UNLOCKED").is_none_or(|v| v != "0") {
+            assert!(unlocked());
+        }
+        let _restore = Restore(UNLOCKED_IN_TEST.replace(Some(false)));
+        assert!(!unlocked());
+        UNLOCKED_IN_TEST.set(Some(true));
+        assert!(unlocked());
     }
 }
 
@@ -4912,7 +4930,7 @@ mod many_askers_tests {
             if VIEWS > 1 {
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
-                    super::UNLOCKED_IN_TEST.set(unlocked >> 31 != 0);
+                    super::UNLOCKED_IN_TEST.set(Some(unlocked >> 31 != 0));
                     let mut last = [0u64; VIEWS];
                     for round in 0..300usize {
                         let (page, asked) = (round * 5 % PAGES, round % VIEWS);
@@ -4943,7 +4961,7 @@ mod many_askers_tests {
                 let (by_bits, past, title_beside) = (&by_bits, &past, &title_beside);
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
-                    super::UNLOCKED_IN_TEST.set(unlocked >> t & 1 != 0);
+                    super::UNLOCKED_IN_TEST.set(Some(unlocked >> t & 1 != 0));
                     let mut last = [[0u64; PAGES]; VIEWS];
                     let mut seed = t as u64 * 7919 + 1;
                     let mut next = |n: usize| {
@@ -5211,10 +5229,10 @@ mod many_askers_tests {
     /// The two tests around, with write faults that take no lock.
     #[test]
     fn bits_and_holes_with_faults_that_take_no_lock() {
-        super::UNLOCKED_IN_TEST.set(true);
+        super::UNLOCKED_IN_TEST.set(Some(true));
         bits_go_with_the_guard();
         holes_are_known_until_the_runtime_tells();
-        super::UNLOCKED_IN_TEST.set(false);
+        super::UNLOCKED_IN_TEST.set(None);
     }
 
     /// A block's bit goes with everything that makes it the title's to write,
