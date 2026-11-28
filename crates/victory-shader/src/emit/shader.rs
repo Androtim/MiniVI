@@ -543,14 +543,27 @@ impl Shader {
                 if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
                     continue;
                 }
-                let mut modes = self.inputs.iter()
+                let used_modes: Vec<u8> = self
+                    .inputs
+                    .iter()
                     .filter(|e| e.row == unused.row && e.usage != 0)
-                    .map(|e| e.interp);
-                if let Some(mode) = modes.next()
-                    && (mode == 1 || unused.comp == 9)
-                    && modes.all(|other| other == mode)
+                    .map(|e| e.interp)
+                    .collect();
+                if let Some(&mode) = used_modes.first() {
+                    if (mode == 1 || unused.comp == 9)
+                        && used_modes.iter().all(|&other| other == mode)
+                    {
+                        self.inputs[index].interp = mode;
+                    }
+                } else if unused.comp == 9
+                    && self
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .any(|(j, e)| j != index && e.row == unused.row && e.interp == 1)
                 {
-                    self.inputs[index].interp = mode;
+                    // E.g. an unused float TEXCOORD sharing a row with unused SV_IsFrontFace.
+                    self.inputs[index].interp = 1;
                 }
             }
         }
@@ -1009,5 +1022,72 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::super::container::SigElement;
+    use super::Shader;
+    use crate::dxbc::{Container, FourCC};
+
+    #[test]
+    fn unused_float_input_matches_unused_constant_row_mate() {
+        let mut s = Shader::new(true);
+        s.inputs = vec![
+            SigElement {
+                name: "TEXCOORD".into(),
+                index: 9,
+                kind: 0,
+                comp: 9,
+                interp: 2,
+                row: Some(0),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            },
+            SigElement {
+                name: "SV_IsFrontFace".into(),
+                index: 0,
+                kind: 13,
+                comp: 5,
+                interp: 1,
+                row: Some(0),
+                col: 1,
+                cols: 1,
+                usage: 0,
+                half: false,
+            },
+        ];
+        s.outputs = vec![SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        s.m.terminate(s.entry, Term::Ret);
+        let dxil = s.finish();
+
+        // Check PSV0 signature element 0 (TEXCOORD9) has interp mode 1.
+        let c = Container::parse(&dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let row = [1, 0, 0x41, 0, 3];
+        let at = psv.windows(5).position(|w| w == row).unwrap();
+        assert_eq!(psv[at + 5], 1);
+
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil.clone()).unwrap();
+        }
     }
 }

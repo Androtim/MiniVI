@@ -230,20 +230,16 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
+    // Names of arbitrary semantics (system values use ""), not deduplicated, then indices.
     let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            let at = strings.len();
+            strings.extend(e.name.as_bytes());
+            strings.push(0);
+            at
         } else {
             0
         };
@@ -300,10 +296,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -488,5 +480,110 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn psv_string_table_does_not_deduplicate_arbitrary_semantics() {
+        let tex0 = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let tex1 = SigElement {
+            index: 1,
+            row: Some(1),
+            ..tex0.clone()
+        };
+        let sv_pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let data = psv(&Psv {
+            stage: 1,
+            flag: true,
+            inputs: &[tex0, tex1],
+            outputs: &[sv_pos],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        // Header: 4 (size) + 48 (info) + 4 (bindings=0) = 56.
+        // Next u32 is string table byte length, then string bytes.
+        let str_len = u32::from_le_bytes(data[56..60].try_into().unwrap()) as usize;
+        let strings = &data[60..60 + str_len];
+        // Leading "", then "TEXCOORD\0", then second "TEXCOORD\0", zero-padded to 4 bytes.
+        assert_eq!(&strings[..19], b"\0TEXCOORD\0TEXCOORD\0");
+        // Indices table follows strings, then signature element stride (4) + 3 elements * 16 bytes.
+        let idx_count = u32::from_le_bytes(data[60 + str_len..64 + str_len].try_into().unwrap()) as usize;
+        let elem_base = 64 + str_len + idx_count * 4 + 4;
+        let name_off = |i: usize| {
+            u32::from_le_bytes(data[elem_base + 16 * i..elem_base + 16 * i + 4].try_into().unwrap())
+        };
+        assert_eq!(name_off(0), 1);
+        assert_eq!(name_off(1), 10);
+        assert_eq!(name_off(2), 0);
+    }
+
+    #[test]
+    fn mesh_vertex_outputs_preserve_declared_interpolation() {
+        let mut tex_const = SigElement {
+            name: "TEXCOORD".into(),
+            index: 9,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(7),
+            col: 1,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let tex_int = SigElement {
+            index: 5,
+            comp: 5,
+            col: 0,
+            ..tex_const.clone()
+        };
+        let psv = psv(&Psv {
+            stage: 13,
+            flag: false,
+            inputs: &[],
+            outputs: &[tex_int.clone(), tex_const.clone()],
+            prims: &[],
+            mesh: Some((
+                super::super::shader::Mesh {
+                    max_vertices: 128,
+                    max_primitives: 128,
+                    topology: 2,
+                },
+                0,
+            )),
+            geometry: None,
+            bindings: &[],
+            threads: [128, 1, 1],
+            wave_size: None,
+        });
+        tex_const.interp = 2;
+        let mut out = [tex_int, tex_const];
+        super::super::vertex_output_interpolation(&psv, &mut out).unwrap();
+        assert_eq!(out[1].interp, 1);
     }
 }

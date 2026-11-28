@@ -11946,11 +11946,15 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
-                // The clamped then the unclamped level of detail.
+                // The clamped then the unclamped level of detail. Out-of-bound coords
+                // for array/2D/1D dimensions must be `undef` for DXIL validation.
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                let fu = self.s.m.undef(f32t);
+                let c1 = if kind == 6 { fu } else { cs[1] };
+                let c2 = if kind == 6 || kind == 7 { fu } else { cs[2] };
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -11959,7 +11963,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, cs[0], c1, c2, clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
