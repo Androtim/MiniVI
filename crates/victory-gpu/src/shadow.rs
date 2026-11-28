@@ -5736,7 +5736,10 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     });
     let video_memory = host.video_memory();
     let (most, pct) = memory_card_budget(video_memory.map(|[budget, ..]| budget), override_mb);
-    let room = video_memory.is_none_or(|[budget, used, ..]| used.saturating_add(len) < budget / 100 * pct);
+    // (And with room left for the render targets still to come:
+    // `crate::resource::by_address_room`.)
+    let room = video_memory
+        .is_none_or(|[budget, used, ..]| crate::resource::by_address_room(budget, used, len, pct));
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.load(Ordering::Relaxed).saturating_add(len) <= most {
         let made = host.uav_buffer(len);
