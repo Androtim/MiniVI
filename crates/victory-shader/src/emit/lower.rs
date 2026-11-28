@@ -142,6 +142,16 @@ const POPS_PACKER: u16 = 25;
 /// The operand `src_pops_exiting_wave_id`.
 const POPS_EXITING: u8 = 239;
 
+/// Whether pixel float colour outputs are held to the console's HDR range
+/// `[-65024, 65024]` (`VICTORY_HDR_CLAMP=0`: off). From aki-gta6/aki-runtime
+/// 01f6f31 via ProjectLeonida/mandy 1411b6c.
+fn hdr_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HDR_CLAMP").is_none_or(|v| v != "0"))
+}
+
+const HDR_MAX: f32 = 65024.0;
+
 /// The instructions inside a pixel program's ordered section
 /// (primitive-ordered pixel shading, which the console compiler makes of
 /// rasterizer ordered views): from the write of `POPS_PACKER`, along every
@@ -1711,6 +1721,33 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes.
+pub(super) fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[&crate::resource::Address],
+    lowest: u32,
+) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses
+        .iter()
+        .any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2127,22 +2164,26 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
+                    .collect();
+                let lowest = addresses
+                    .iter()
                     .map(|a| a.offset & !3)
                     .min()
                     .ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -4231,6 +4272,22 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
+    }
+
+    /// Holds a pixel float colour output to `[-65024, 65024]` (`VICTORY_HDR_CLAMP`).
+    /// Prevents >65504 values from becoming `+Inf` in 16-bit float host targets
+    /// (which the title's tonemap turns into black blobs/glitter).
+    fn clamp_hdr(&mut self, f: V) -> V {
+        if !hdr_clamp() {
+            return f;
+        }
+        let c = self.cur;
+        let min = self.s.m.f32((-HDR_MAX).to_bits());
+        let max = self.s.m.f32(HDR_MAX.to_bits());
+        let lo = self.binary(35, f, min); // FMax
+        let hi = self.binary(36, lo, max); // FMin
+        let nan = self.is_nan_f32(f);
+        self.s.m.select(c, nan, max, hi)
     }
 
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
@@ -13264,16 +13321,21 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let is_ps = !mesh && matches!(self.x.native.stage, HwStage::Ps);
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            let colour = is_ps && el.kind == 16;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    (".f32", if colour { self.clamp_hdr(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    (".f32", f)
+                    (".f32", if colour { self.clamp_hdr(f) } else { f })
                 }
                 _ => (".i32", x),
             };
