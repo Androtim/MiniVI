@@ -92,6 +92,8 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
     Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
+    // Keys and sensitivity in bindings.ini in %LOCALAPPDATA%\victory (apps\victory\src\play.rs).
+    Item { var: "VICTORY_MNK", label: "MOUSE AND KEYBOARD", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
@@ -116,8 +118,25 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 5] =
-    ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "PRELOAD SHADERS (RESTARTS THE GAME)", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
+const ACTIONS: [&str; 6] = [
+    "SAVE AND RESTART NOW",
+    "SAVE FOR NEXT START",
+    "PRELOAD SHADERS (RESTARTS THE GAME)",
+    "RESET ALL TO PLAY DEFAULTS",
+    "KEY BINDINGS (MOUSE AND KEYBOARD)",
+    "CLOSE",
+];
+/// The action that opens the list of key bindings ([`binds`]).
+const BINDS: usize = 4;
+const BINDS_TITLE: &str = "KEY BINDINGS                      ESC GOES BACK";
+const BINDS_HELP: &str = "UP/DOWN PICK  ENTER, THEN A KEY OR MOUSE BUTTON";
+const BINDS_BACK: &str = "BACK TO THE SETTINGS";
+const BINDS_OFF: &str = "TURN ON MOUSE AND KEYBOARD AND RESTART FIRST";
+const ABOUT_BINDS: [&str; 3] = [
+    "THE KEY OR MOUSE BUTTON PRESSED REPLACES THE LINE KEYS.",
+    "ESC CANCELS. LEFT/RIGHT CHANGES THE SENSITIVITY.",
+    "SAVED TO BINDINGS.INI AND USED AT ONCE.",
+];
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
@@ -382,6 +401,8 @@ pub(super) struct Menu {
     painted: Option<String>,
     buffers: Option<Buffers>,
     failed: bool,
+    /// The key bindings list, while it is shown.
+    binds: Option<binds::Binds>,
 }
 
 impl Menu {
@@ -393,7 +414,7 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, binds: None }
     }
 
     fn open() -> bool {
@@ -401,6 +422,9 @@ impl Menu {
     }
 
     fn lines(&self) -> Vec<String> {
+        if let Some(b) = &self.binds {
+            return self.bind_lines(b);
+        }
         let total = ITEMS.len() + ACTIONS.len();
         let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
@@ -435,6 +459,43 @@ impl Menu {
         out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
         out.push(REPO.to_owned());
         out
+    }
+
+    /// The list KEY BINDINGS opens, in the box's lines.
+    fn bind_lines(&self, b: &binds::Binds) -> Vec<String> {
+        let mut out = vec![BINDS_TITLE.to_owned(), BINDS_HELP.to_owned(), String::new()];
+        let total = binds::ROWS.len() + 1;
+        let first = b.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
+        for row in first..(first + ROWS).min(total) {
+            let cursor = if row == b.at { '>' } else { ' ' };
+            let line = match binds::ROWS.get(row) {
+                Some((name, label)) => {
+                    let value = b.value(name);
+                    format!("{cursor} {label:<27} {}", if value.is_empty() { "NONE" } else { &value })
+                }
+                None => format!("{cursor} {BINDS_BACK}"),
+            };
+            out.push(line.chars().take(COLUMNS as usize).collect());
+        }
+        while out.len() < 3 + ROWS {
+            out.push(String::new());
+        }
+        out.push(String::new());
+        out.extend(ABOUT_BINDS.iter().map(|l| (*l).to_owned()));
+        out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        out.push(REPO.to_owned());
+        out
+    }
+
+    /// While a binding waits for its key: the key or button pressed is written.
+    fn hear_binding(&mut self) {
+        let Some(b) = self.binds.as_mut() else { return };
+        let Some(vk) = b.heard() else { return };
+        let (name, label) = binds::ROWS[b.at];
+        let key = binds::name(vk);
+        self.note = if b.set(name, &key) { format!("{label}: {}", key.to_ascii_uppercase()) } else { "COULD NOT SAVE BINDINGS.INI".to_owned() };
+        self.note = self.note.chars().take(COLUMNS as usize).collect();
+        self.changed = true;
     }
 
     /// Changes item `i` by `step` (+1 / -1) through its values.
@@ -613,14 +674,25 @@ impl Menu {
         self.warmup();
         let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
         if pressed.is_empty() {
+            self.hear_binding();
             return;
         }
         let total = ITEMS.len() + ACTIONS.len();
         for vk in pressed {
             let open = Self::open();
+            // Esc in the key bindings: a wait for a key ends, else back to the settings.
+            if open && vk == VK_ESCAPE && let Some(b) = self.binds.as_mut() {
+                if b.waiting.take().is_none() {
+                    self.binds = None;
+                }
+                self.note.clear();
+                self.changed = true;
+                continue;
+            }
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
                 self.note.clear();
+                self.binds = None;
                 self.changed = true;
                 continue;
             }
@@ -631,6 +703,31 @@ impl Menu {
             let confirmed = self.note == CONFIRM_PRELOAD;
             if confirmed {
                 self.note.clear();
+            }
+            if let Some(b) = self.binds.as_mut() {
+                let n = binds::ROWS.len() + 1;
+                let sensitivity = binds::ROWS.get(b.at).is_some_and(|(name, _)| *name == binds::SENSITIVITY);
+                if b.waiting.is_none() {
+                    match vk {
+                        VK_UP => b.at = (b.at + n - 1) % n,
+                        VK_DOWN => b.at = (b.at + 1) % n,
+                        VK_RETURN if b.at == binds::ROWS.len() => self.binds = None,
+                        VK_LEFT | VK_RIGHT if sensitivity => {
+                            self.note = match b.sensitivity(if vk == VK_LEFT { -1 } else { 1 }) {
+                                Some(v) => format!("MOUSE SENSITIVITY: {v}"),
+                                None => "COULD NOT SAVE BINDINGS.INI".to_owned(),
+                            };
+                        }
+                        VK_RETURN if !sensitivity => {
+                            let label = binds::ROWS[b.at].1;
+                            b.listen();
+                            self.note = format!("PRESS A KEY OR MOUSE BUTTON: {label}").chars().take(COLUMNS as usize).collect();
+                        }
+                        _ => {}
+                    }
+                }
+                self.changed = true;
+                continue;
             }
             match vk {
                 VK_UP => self.at = (self.at + total - 1) % total,
@@ -654,12 +751,20 @@ impl Menu {
                         }
                     }
                     3 => self.reset(),
+                    BINDS => match binds::Binds::open() {
+                        Some(b) => {
+                            self.binds = Some(b);
+                            self.note.clear();
+                        }
+                        None => BINDS_OFF.clone_into(&mut self.note),
+                    },
                     _ => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
                 },
                 _ => {}
             }
             self.changed = true;
         }
+        self.hear_binding();
     }
 
     /// Records the copy of the box onto `back` (in the copy-destination state).
@@ -731,6 +836,164 @@ impl Menu {
     }
 }
 
+/// The mouse and keyboard bindings (`bindings.ini`, F1's MOUSE AND KEYBOARD) as KEY BINDINGS
+/// edits them: a line's keys replaced by the one pressed, written at once.
+mod binds {
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    pub(super) const SENSITIVITY: &str = "Sensitivity";
+    /// The name in the file, and on the line.
+    pub(super) const ROWS: [(&str, &str); 21] = [
+        ("MoveUp", "MOVE FORWARD"),
+        ("MoveDown", "MOVE BACK"),
+        ("MoveLeft", "MOVE LEFT"),
+        ("MoveRight", "MOVE RIGHT"),
+        ("RT", "RT (SHOOT, ACCELERATE)"),
+        ("LT", "LT (AIM, BRAKE)"),
+        ("A", "A (CONFIRM)"),
+        ("B", "B (BACK)"),
+        ("X", "X"),
+        ("Y", "Y (CAR IN OR OUT)"),
+        ("LB", "LB"),
+        ("RB", "RB"),
+        ("LS", "LEFT STICK CLICK"),
+        ("RS", "RIGHT STICK CLICK"),
+        ("Menu", "MENU"),
+        ("View", "VIEW"),
+        ("DpadUp", "D-PAD UP"),
+        ("DpadDown", "D-PAD DOWN"),
+        ("DpadLeft", "D-PAD LEFT"),
+        ("DpadRight", "D-PAD RIGHT"),
+        (SENSITIVITY, "MOUSE SENSITIVITY"),
+    ];
+
+    pub(super) struct Binds {
+        file: PathBuf,
+        text: String,
+        pub(super) at: usize,
+        /// Waiting for a key: what was held when the wait began (it must be let go first).
+        pub(super) waiting: Option<[bool; 256]>,
+    }
+
+    impl Binds {
+        /// The file the game was started with (VICTORY_MNK_BINDINGS), if any.
+        pub(super) fn open() -> Option<Binds> {
+            let file = PathBuf::from(std::env::var_os("VICTORY_MNK_BINDINGS")?);
+            let text = std::fs::read_to_string(&file).ok()?;
+            Some(Binds { file, text, at: 0, waiting: None })
+        }
+
+        #[cfg(test)]
+        pub(super) fn of(text: &str) -> Binds {
+            Binds { file: PathBuf::new(), text: text.to_owned(), at: 0, waiting: None }
+        }
+
+        /// What the file sets `name` to, upper case ("" if nothing).
+        pub(super) fn value(&self, name: &str) -> String {
+            self.text.lines().find_map(|l| setting(l, name)).map(|v| v.trim().to_ascii_uppercase()).unwrap_or_default()
+        }
+
+        /// `name` set to `value` (its first line replaced, others of it dropped), written.
+        pub(super) fn set(&mut self, name: &str, value: &str) -> bool {
+            self.text = with(&self.text, name, value);
+            let written = std::fs::write(&self.file, &self.text).is_ok();
+            if written {
+                crate::MNK_BINDINGS_CHANGED.fetch_add(1, Relaxed);
+            }
+            written
+        }
+
+        /// The sensitivity a step up or down (0.015 each), written; the new value.
+        pub(super) fn sensitivity(&mut self, step: isize) -> Option<String> {
+            let now = self.value(SENSITIVITY).parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.135);
+            let next = format!("{:.3}", (now + 0.015 * step as f32).clamp(0.015, 1.5));
+            self.set(SENSITIVITY, &next).then_some(next)
+        }
+
+        pub(super) fn listen(&mut self) {
+            self.waiting = Some(held());
+        }
+
+        /// While waiting: a key or mouse button pressed since (not Esc, which cancels, nor F1).
+        pub(super) fn heard(&mut self) -> Option<u8> {
+            let was = self.waiting.as_mut()?;
+            let now = held();
+            let key = (1..255).find(|&vk| now[vk] && !was[vk] && !matches!(vk, 0x1B | 0x70)).map(|vk| vk as u8);
+            *was = now;
+            if key.is_some() {
+                self.waiting = None;
+            }
+            key
+        }
+    }
+
+    fn held() -> [bool; 256] {
+        let mut down = [false; 256];
+        for (vk, d) in down.iter_mut().enumerate().skip(1).take(254) {
+            // SAFETY: a plain query.
+            *d = unsafe { GetAsyncKeyState(vk as i32) } < 0;
+        }
+        down
+    }
+
+    /// The value of a `name = value` line (case aside), comments cut.
+    fn setting<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        let (k, v) = line.split('#').next()?.split_once('=')?;
+        k.trim().eq_ignore_ascii_case(name).then_some(v)
+    }
+
+    fn with(text: &str, name: &str, value: &str) -> String {
+        let end = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut out: Vec<String> = Vec::new();
+        let mut done = false;
+        for line in text.lines() {
+            if setting(line, name).is_some() {
+                if !done {
+                    out.push(format!("{name} = {value}"));
+                    done = true;
+                }
+                continue;
+            }
+            out.push(line.to_owned());
+        }
+        if !done {
+            out.push(format!("{name} = {value}"));
+        }
+        out.join(end) + end
+    }
+
+    /// A key as the bindings file names it (what the input module reads).
+    pub(super) fn name(vk: u8) -> String {
+        match vk {
+            b'A'..=b'Z' | b'0'..=b'9' => (vk as char).to_string(),
+            1 => "Mouse1".into(),
+            2 => "Mouse2".into(),
+            4 => "Mouse3".into(),
+            5 => "Mouse4".into(),
+            6 => "Mouse5".into(),
+            8 => "Backspace".into(),
+            9 => "Tab".into(),
+            13 => "Enter".into(),
+            16 => "Shift".into(),
+            17 => "Ctrl".into(),
+            18 => "Alt".into(),
+            32 => "Space".into(),
+            37 => "Left".into(),
+            38 => "Up".into(),
+            39 => "Right".into(),
+            40 => "Down".into(),
+            _ => format!("0x{vk:02X}"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn edited(text: &str, name: &str, value: &str) -> String {
+        with(text, name, value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,7 +1007,7 @@ mod tests {
             std::env::remove_var("VICTORY_MENU_FILE");
             std::env::set_var("VICTORY_HOME", &home);
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, binds: None };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
@@ -761,7 +1024,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, binds: None };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -776,7 +1039,7 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, binds: None };
         menu.started = menu.values.clone();
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -805,8 +1068,37 @@ mod tests {
     }
 
     #[test]
+    fn key_bindings_are_shown_and_written() {
+        let text = "# keys\r\nSensitivity = 0.135\r\nRT = Mouse1\r\nY = F # car\r\nY = G\r\n";
+        let edited = binds::edited(text, "Y", "E");
+        assert_eq!(edited, "# keys\r\nSensitivity = 0.135\r\nRT = Mouse1\r\nY = E\r\n");
+        assert!(binds::edited("A = Shift\n", "LB", "Tab").ends_with("LB = Tab\n"));
+        let b = binds::Binds::of(&edited);
+        assert_eq!((b.value("rt").as_str(), b.value("Y").as_str(), b.value("LB").as_str()), ("MOUSE1", "E", ""));
+        assert_eq!((binds::name(b'W'), binds::name(1), binds::name(0xA2)), ("W".to_owned(), "Mouse1".to_owned(), "0xA2".to_owned()));
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, binds: Some(b) };
+        menu.started = menu.values.clone();
+        let mut fixed = [BINDS_TITLE, BINDS_HELP, BINDS_BACK, BINDS_OFF, "COULD NOT SAVE BINDINGS.INI", "MOUSE SENSITIVITY: 0.150"].map(str::to_owned).to_vec();
+        fixed.extend(binds::ROWS.iter().map(|(_, l)| format!("PRESS A KEY OR MOUSE BUTTON: {l}")));
+        for at in 0..=binds::ROWS.len() {
+            menu.binds.as_mut().expect("shown").at = at;
+            let lines = menu.lines();
+            assert_eq!(lines.len(), 3 + ROWS + 1 + 3 + 2);
+            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_BINDS);
+            assert!(lines.iter().any(|l| l.starts_with('>')));
+            fixed.extend(lines);
+        }
+        for line in fixed.iter().map(String::as_str).chain(ABOUT_BINDS) {
+            assert!(line.len() <= COLUMNS as usize, "{line}");
+            for c in line.bytes() {
+                assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
+            }
+        }
+    }
+
+    #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, binds: None };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {

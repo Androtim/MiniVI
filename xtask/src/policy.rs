@@ -26,6 +26,7 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",
+    "bindings.ini",
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
