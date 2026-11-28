@@ -4815,11 +4815,30 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if typeless {
+            return false;
+        }
+        if unordered && !typed_store(own) {
+            once!(
+                view = own,
+                own,
+                "an unordered view in a format the host cannot store"
+            );
+            return false;
+        }
+        return true;
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
     if view != own && crate::resource::target_format(view) == own {
+        if unordered && !typed_store(own) {
+            once!(
+                view = own,
+                own,
+                "an unordered view in a format the host cannot store"
+            );
+            return false;
+        }
         if let Some(format) = format {
             *format = d.Format;
         }
@@ -4827,6 +4846,15 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
+        return false;
+    }
+    let typed = if typeless { view } else { own };
+    if unordered && !typed_store(typed) {
+        once!(
+            view = typed,
+            own,
+            "an unordered view in a format the host cannot store"
+        );
         return false;
     }
     if let Some(format) = format
@@ -4840,6 +4868,34 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Whether the host card can store to a typed unordered access view of `format`
+/// (from `Marvisak/VIctory` ea488a9, #2462).
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -7103,5 +7159,51 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+
+    #[test]
+    fn typed_store_and_fits_reject_unsupported_unordered_view_formats() {
+        let Some(h) = host() else { return };
+        assert!(typed_store(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32));
+        assert!(!typed_store(DXGI_FORMAT_BC7_UNORM.0 as u32));
+        let _ = typed_store(DXGI_FORMAT_B5G5R5A1_UNORM.0 as u32);
+
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: valid resource and heap descriptions on a live device.
+        unsafe {
+            h.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut tex,
+            )
+        }
+        .expect("R8G8B8A8_TYPELESS UAV texture");
+        let tex = tex.unwrap();
+
+        let mut unorm = DXGI_FORMAT_R8G8B8A8_UNORM;
+        assert!(fits(&tex, Some(&mut unorm), true));
+        assert!(!fits(&tex, None, true));
+
+        let mut srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        assert!(fits(&tex, Some(&mut srgb), true));
+        assert_eq!(srgb, DXGI_FORMAT_R8G8B8A8_UNORM);
     }
 }
