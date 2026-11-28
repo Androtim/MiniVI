@@ -28,8 +28,10 @@ param(
     # Frames shown for each one rendered with -FrameGen: 2 to 6 (more than 2 needs an RTX 50; the layer asks the
     # driver how many this card does and gives no more).
     [ValidateRange(2, 6)][int]$FrameGenX = 2,
-    # Frame generation is made ready at every start with Streamline, on or off, so that the F1 menu switches it
-    # and changes its amount while playing. -NoFrameGenReady: only with -FrameGen, as before.
+    # Frame generation made ready but off at the start, so that the F1 menu switches it while playing.
+    # Off by default so non-framegen frames do not go through Streamline's swap chain.
+    [switch]$FrameGenReady,
+    # (The default now; still accepted.)
     [switch]$NoFrameGenReady,
     # Which frame generation: auto (DLSS Frame Generation where it runs, else AMD's FSR 3), dlss, or fsr (FSR 3
     # even on an RTX 40/50; 2X only). FSR 3 needs AMD's FidelityFX DLLs (VICTORY_FIDELITYFX_DIR, else
@@ -99,13 +101,15 @@ if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
 }
+$dlssOn = $false
 if ($Dlss -ne 'off') {
     # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.
     $sl = if ($env:VICTORY_STREAMLINE_DIR) { $env:VICTORY_STREAMLINE_DIR } else { Join-Path $repo 'nvidia-sdk\Streamline\bin\x64' }
     if (Test-Path (Join-Path $sl 'sl.interposer.dll')) {
+        $dlssOn = $true
         $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss; $settings.VICTORY_STREAMLINE_DIR = $sl
         if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = [string]$timesWanted }
-        elseif (-not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
+        elseif ($FrameGenReady -and -not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
         # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures up
         # to nine tenths of its budget (on a 12 GB card it then ran out: no generated frames). On from the start, it
         # is left a fifth of the budget; ready but off, a little less is held back.
@@ -115,9 +119,10 @@ if ($Dlss -ne 'off') {
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
     }
 }
-# AMD FSR 3 frame generation: made ready as DLSS Frame Generation is (on, or ready and off for the F1 menu).
+# AMD FSR 3 frame generation: only with DLSS on (otherwise FidelityFX left with AMD's files stops at boot),
+# made ready as DLSS Frame Generation is (on, or ready and off with -FrameGenReady for the F1 menu).
 # auto: the layer uses it only where DLSS Frame Generation does not run; fsr: DLSS Frame Generation is not asked.
-if ($FgType -ne 'dlss' -and ($FrameGen -or -not $NoFrameGenReady)) {
+if ($dlssOn -and $FgType -ne 'dlss' -and ($FrameGen -or ($FrameGenReady -and -not $NoFrameGenReady))) {
     $fx = if ($env:VICTORY_FIDELITYFX_DIR) { $env:VICTORY_FIDELITYFX_DIR } else { Join-Path $repo 'amd-sdk\FidelityFX\bin' }
     # Asked whatever is here: the layer checks the files and the card, and the start's notice (on the picture for
     # its first 30 s, and in this window) says what runs and why not. On Series X without DLSS it stays off: the
@@ -148,7 +153,7 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

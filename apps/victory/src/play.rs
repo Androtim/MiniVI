@@ -144,10 +144,15 @@ pub(crate) struct Play {
     #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
     dlss: String,
     /// DLSS frame generation on from the start: frames shown for each one
-    /// rendered, 2 to 6. Without it, it is ready and the F1 menu switches it.
+    /// rendered, 2 to 6. Without it, it is off (see `--framegen-ready`).
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=6))]
     framegen: Option<u32>,
-    /// Frame generation not made ready at the start.
+    /// Frame generation made ready but off at the start, so that the F1 menu
+    /// switches it while playing. Not by default: ready but off, frames go
+    /// through Streamline's swap chain, which can cap non-framegen frame rate.
+    #[arg(long)]
+    framegen_ready: bool,
+    /// (The default now; still accepted.)
     #[arg(long)]
     no_framegen_ready: bool,
     /// Which frame generation: auto (DLSS frame generation where the card has
@@ -291,6 +296,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             _ => {}
         }
     }
+    let ready = o.framegen_ready && !o.no_framegen_ready;
     let (mut dlss_on, mut framegen_x) = (false, None);
     if dlss != "off"
         && let Some(dir) = streamline
@@ -301,7 +307,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         set("VICTORY_STREAMLINE_DIR", &dir.to_string_lossy());
         if framegen {
             framegen_x = Some(times);
-        } else if !o.no_framegen_ready {
+        } else if ready {
             framegen_x = Some(0); // ready, off
         }
         if let Some(x) = framegen_x {
@@ -313,10 +319,11 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             set("VICTORY_TEXTURE_ROOM_PERCENT", if framegen { "80" } else { "86" });
         }
     }
-    // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
+    // AMD FSR 3 frame generation, only with DLSS on (otherwise FidelityFX left with AMD's
+    // files stops at boot), made ready as DLSS frame generation is: auto, the layer uses
     // it only where DLSS frame generation does not run; fsr, DLSS frame generation is not asked.
     // The layer checks the files and the card and says at the start what runs and why not.
-    if fg_type != "dlss" && (framegen || !o.no_framegen_ready) {
+    if dlss_on && fg_type != "dlss" && (framegen || ready) {
         set("VICTORY_FSR_FRAMEGEN", "1");
         if fg_type == "fsr" {
             s.remove("VICTORY_FRAMEGEN");
@@ -857,7 +864,11 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
     s.insert(
         "VICTORY_MENU_ARGS".to_owned(),
-        format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
+        format!(
+            "play {}{}",
+            quoted(&exe),
+            if o.framegen_ready && !o.no_framegen_ready { " --framegen-ready" } else { "" }
+        ),
     );
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
@@ -910,6 +921,7 @@ mod tests {
             res: "1440".to_owned(),
             dlss: "quality".to_owned(),
             framegen: None,
+            framegen_ready: false,
             no_framegen_ready: false,
             fg_type: "auto".to_owned(),
             fps: 1000,
@@ -930,9 +942,12 @@ mod tests {
         assert_eq!(get("VICTORY_NATIVE_1440P"), Some("1"));
         assert_eq!((get("VICTORY_DLSS"), get("VICTORY_DLSS_MODE")), (Some("1"), Some("quality")));
         assert_eq!(get("VICTORY_STREAMLINE_DIR"), Some(r"C:\nvidia"));
-        // frame generation ready, off, with a little memory held back for it
-        assert_eq!((get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        // frame generation stays off and uninitialized unless asked for
+        assert_eq!(
+            (get("VICTORY_FRAMEGEN"), get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")),
+            (None, None, None)
+        );
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), None);
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("1000"));
         assert_eq!((get("VICTORY_MENU_DLSS"), get("VICTORY_MENU_FRAMEGEN")), (Some("quality"), Some("0")));
         assert_eq!((get("VICTORY_MENU_CONSOLE"), get("VICTORY_MENU_FPS")), (Some("series-x"), Some("1000")));
@@ -944,10 +959,32 @@ mod tests {
         let get = |k: &str| s.get(k).map(String::as_str);
         assert!(!s.contains_key("VICTORY_DLSS") && !s.contains_key("VICTORY_FRAMEGEN"));
         assert_eq!(get("VICTORY_MENU_DLSS"), Some("off"));
-        // FSR 3 frame generation is made ready instead (the layer says whether it can run)
-        assert_eq!((get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        assert_eq!(
+            (get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X"), get("VICTORY_TEXTURE_ROOM_PERCENT")),
+            (None, None, None)
+        );
         assert_eq!(get("VICTORY_MENU_FG_TYPE"), Some("auto"));
+    }
+
+    #[test]
+    fn framegen_ready_prepares_frame_generation_off() {
+        let mut o = options();
+        o.framegen_ready = true;
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!(
+            (get("VICTORY_FRAMEGEN"), get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")),
+            (Some("1"), Some("1"), Some("0"))
+        );
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+
+        o.no_framegen_ready = true;
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!(
+            (get("VICTORY_FRAMEGEN"), get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X"), get("VICTORY_TEXTURE_ROOM_PERCENT")),
+            (None, None, None, None)
+        );
     }
 
     #[test]
