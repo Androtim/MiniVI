@@ -71,6 +71,18 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// A reference more to `this` only while it still has one: `false` if it is
+/// being released (its count reached 0). From CuteBooty/victory-8gb (after
+/// fxceless, victory-fork d4a528ba), for [`crate::resource::alias_of`].
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n > 0).then(|| n.saturating_add(1))
+    })
+    .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -560,5 +572,23 @@ mod tests {
         );
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    #[test]
+    fn add_ref_alive_increments_live_and_refuses_zero() {
+        static TABLE: Table<0> = Table([]);
+        let this: This = Box::into_raw(Box::new(Object::new(&TABLE)));
+        // SAFETY: `this` is a valid boxed `Object`.
+        let obj = unsafe { &*this };
+        assert_eq!(obj.refs.load(Ordering::Relaxed), 0);
+        assert!(!add_ref_alive(this));
+        assert_eq!(add_ref(this), 1);
+        assert!(add_ref_alive(this));
+        assert_eq!(obj.refs.load(Ordering::Relaxed), 2);
+        obj.refs.store(0, Ordering::Relaxed);
+        assert!(!add_ref_alive(this));
+        assert_eq!(obj.refs.load(Ordering::Relaxed), 0);
+        // SAFETY: freeing test allocation once checks complete.
+        drop(unsafe { Box::from_raw(this.cast_mut()) });
     }
 }
