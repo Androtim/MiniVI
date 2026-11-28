@@ -511,8 +511,53 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran ([`emit_once`]). A wave64 compute program
+/// that does not translate with the branches that close or leave its loops taken by each host
+/// wave together ([`loops_wave`]) is tried once more without them, as before that step: the
+/// underwater picture's program (`926c46bab3b86bd6`) translated before it and no longer did, so
+/// its dispatch was dropped.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res);
+    if !matches!(first, Err(ShaderError::Unsupported { .. })) || !loops_wave(native) {
+        return first;
+    }
+    match with_loops_off(|| emit_once(c, native, p, st, io, res)) {
+        Ok(shader) => {
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!("WAVE-LOOPS left out: the program translates without them");
+            }
+            Ok(shader)
+        }
+        Err(_) => first,
+    }
+}
+
+thread_local! {
+    /// [`emit`]'s second try: [`loops_wave`] off.
+    static LOOPS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`loops_wave`] disabled on this thread, restoring the previous state on exit.
+fn with_loops_off<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LOOPS_OFF.with(|off| off.set(self.0));
+        }
+    }
+    let _reset = Reset(LOOPS_OFF.with(|off| off.replace(true)));
+    f()
+}
+
+/// One try of [`emit`].
+fn emit_once(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -915,7 +960,7 @@ fn widen(
 /// - `2`: every compute program;
 /// - `0`: none, as before.
 fn loops_wave(native: &NativeProgram) -> bool {
-    if native.stage != HwStage::Cs {
+    if native.stage != HwStage::Cs || LOOPS_OFF.with(std::cell::Cell::get) {
         return false;
     }
     match std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) {
@@ -2910,6 +2955,52 @@ mod atomic_tests {
             {
                 v.validate(&mut shader.dxil.clone()).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn loops_wave_disabled_inside_with_loops_off_and_restored() {
+        struct WaveRestore(Option<u32>);
+        impl Drop for WaveRestore {
+            fn drop(&mut self) {
+                super::lower::TEST_HOST_WAVE.set(self.0);
+            }
+        }
+        let _wave = WaveRestore(super::lower::TEST_HOST_WAVE.replace(Some(32)));
+        let cs = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: Vec::new(),
+        };
+        let ps = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: true,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: crate::native::StageIo::None,
+            code: Vec::new(),
+        };
+        assert!(!super::loops_wave(&ps));
+        if std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) != Some("0") {
+            assert!(super::loops_wave(&cs));
+            super::with_loops_off(|| assert!(!super::loops_wave(&cs)));
+            assert!(super::loops_wave(&cs));
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::with_loops_off(|| {
+                    assert!(!super::loops_wave(&cs));
+                    panic!("unwind check");
+                });
+            }));
+            assert!(panicked.is_err());
+            assert!(super::loops_wave(&cs));
         }
     }
 }
