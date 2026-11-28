@@ -92,6 +92,10 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_POOL_SMALL", "0"),
     ("VICTORY_TABLED_REREAD", "1"),
     ("VICTORY_QUEUE_HOST_TEXTURES", "0"),
+    // Texture pieces are placed as before (first block that fits), not fullest block first: that
+    // would change how often an empty block is given back to the card, which has not been counted
+    // yet. The gate (no new block past the line) is on either way.
+    ("VICTORY_POOL_FULLEST", "0"),
     // Descriptor heaps' records
     ("VICTORY_HEAP_SYNC_FIRST", "1"),
     ("VICTORY_SYNC_IN_PLACE", "1"),

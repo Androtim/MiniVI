@@ -1792,7 +1792,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // (Not one that only waits for a place in a block,
+            // `crate::pool::waiting`: it is asked for again.)
+            if !crate::pool::waits() {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -1909,14 +1913,155 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept(Some(budget))
-                < room_line(budget)
-        }
+        Some([budget, used, ..]) => weighed(budget, used) < room_line(budget),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// What [`room`] and the sweep ([`let_go_idle`]) weigh against the line, in
+/// bytes of a budget of `budget` with `used` in use: the card's use less
+/// the free part of the texture blocks (new textures take that first), with
+/// what is kept for buffer copies and render targets.
+///
+/// And while the card has no room for a new block of textures
+/// ([`block_room`], `crate::pool::gate`) not less than [`blocks_full`]: the
+/// free part of the blocks is then all the room there is, whatever the
+/// card's use says. (The use less the free part can lie far under the line
+/// then: the reserve for render targets was given up, or the blocks were
+/// made under a larger budget. The queue would hand out textures that find
+/// no place, and the sweep would let none go.)
+#[cfg(windows)]
+fn weighed(budget: u64, used: u64) -> u64 {
+    let free = crate::pool::texture_room();
+    let by_use = used.saturating_sub(free) + crate::shadow::card_room_kept() + targets_room_kept(Some(budget));
+    if crate::pool::gate() && !block_room(Some([budget, used, 0, 0])) {
+        by_use.max(blocks_full(room_line(budget), free))
+    } else {
+        by_use
+    }
+}
+
+/// What is weighed against `line` while no block of textures can be made,
+/// with `free` bytes free in the blocks there are: under the line while
+/// more than a block's worth is free (the queue has room), and so that the
+/// sweep, which lets idle textures go from 2 % of the budget under the line
+/// until 5 % under it, keeps 2 to 5 % of the budget and a block's worth
+/// free in the blocks.
+#[cfg(any(windows, test))]
+fn blocks_full(line: u64, free: u64) -> u64 {
+    (line + POOL_BLOCK).saturating_sub(free)
+}
+
+/// A block of textures (`crate::pool`).
+#[cfg(any(windows, test))]
+const POOL_BLOCK: u64 = 64 << 20;
+
+/// Whether the card has room for one more block of textures
+/// (`crate::pool::gate`): its whole use (not less the free part of the
+/// blocks: a block made is the card's memory in use whatever lies in it),
+/// with the block, with what is kept for card copies of title buffers not
+/// made yet and with what is still to come of render targets
+/// ([`targets_to_come`]), stays within the queue's line ([`room_line`]).
+/// Always while the textures the title fills hold less than their floor
+/// ([`texture_floor_bytes`]), as [`room`]; and without the system's numbers.
+///
+/// The line and not the budget: the line is the budget less what is left
+/// for what the host makes with no room test, and the queue and the sweep
+/// steer to it. What is to come is counted because a block never comes back
+/// as a whole: made into room that render targets take minutes later, it
+/// puts the card over (run 423: the targets grew from 1,772 to 2,626 MB in
+/// seven minutes, the blocks were made in the first of them).
+#[cfg(windows)]
+pub(crate) fn block_room(memory: Option<[u64; 4]>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some([budget, used, ..]) = memory else {
+        return true;
+    };
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let room = filled < texture_floor_bytes(Some(budget))
+        || block_fits(used, crate::shadow::card_room_kept() + targets_to_come(Some(budget)), room_line(budget));
+    crate::pool::note_full(!room);
+    room
+}
+
+/// [`block_room`]'s sum: `used` bytes in use and `kept` to come, with one
+/// more block, within `line`.
+#[cfg(any(windows, test))]
+fn block_fits(used: u64, kept: u64, line: u64) -> bool {
+    used + kept + POOL_BLOCK <= line
+}
+
+/// Whether `len` more bytes of title memory by address (an arena of 64
+/// MiB, `crate::memory`, or a loose range in `crate::shadow::by_address`)
+/// go into the card's own memory: while the card's use with them, and with
+/// what is still to come of render targets ([`targets_to_come`]), stays
+/// under `pct` hundredths of `budget`.
+///
+/// The rule was `pct` hundredths alone. With the texture blocks held under
+/// the queue's line (`crate::pool::gate`) the card has room again, and the
+/// arenas/ranges would take it up to that mark at once (run 423 made 44 of
+/// them, 2.8 GB, and 14 fitted before the card was full); the render
+/// targets then grow for minutes with no room test (+850 MB in that run)
+/// and put the card over its budget again.
+#[cfg(windows)]
+pub(crate) fn by_address_room(budget: u64, used: u64, len: u64, pct: u64) -> bool {
+    by_address_fits(budget, used, len, targets_to_come(Some(budget)), pct)
+}
+
+#[cfg(any(windows, test))]
+fn by_address_fits(budget: u64, used: u64, len: u64, to_come: u64, pct: u64) -> bool {
+    used.saturating_add(len).saturating_add(to_come) < budget / 100 * pct
+}
+
+#[cfg(any(windows, test))]
+const SMALL_BUDGET_CEILING: u64 = 9 << 30;
+
+/// Pure calculation of render-target headroom still to come for [`targets_to_come`].
+/// On cards with `<= 9 GiB` VRAM (`SMALL_BUDGET_CEILING`), uses the settle-aware
+/// `settled_kept` reserve so settled low-res targets do not permanently withhold
+/// ~450 MiB below the texture line after world load; on >=12 GiB cards keeps `most - targets`.
+#[cfg(any(windows, test))]
+fn targets_to_come_bytes(vram_budget: Option<u64>, most: u64, targets: u64, settled_kept: u64) -> u64 {
+    if vram_budget.is_some_and(|budget| budget <= SMALL_BUDGET_CEILING) {
+        settled_kept
+    } else {
+        most.saturating_sub(targets)
+    }
+}
+
+/// The bytes of render targets and other host copies the host itself
+/// writes that are still to come: [`targets_most`] less what such copies
+/// hold now on >=12 GiB cards, or the settle-aware [`targets_room_kept`]
+/// reserve on `<= 9 GiB` cards. It is weighed for what never comes back
+/// (a block of textures, a buffer of title memory by address).
+#[cfg(windows)]
+pub(crate) fn targets_to_come(vram_budget: Option<u64>) -> u64 {
+    let settled_kept = if vram_budget.is_some_and(|budget| budget <= SMALL_BUDGET_CEILING) {
+        targets_room_kept(vram_budget)
+    } else {
+        0
+    };
+    targets_to_come_bytes(vram_budget, targets_most(vram_budget), targets_now(), settled_kept)
+}
+
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_MB` in bytes (3,072 MB on >=12 GiB cards,
+/// scaled to at most `budget / 4` on `<= 9 GiB` cards; 0: none).
+#[cfg(windows)]
+fn targets_most(vram_budget: Option<u64>) -> u64 {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    targets_room_kept_bytes(vram_budget, override_mb)
+}
+
+/// Every host texture's bytes less those of the copies the title fills.
+#[cfg(windows)]
+fn targets_now() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed))
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1952,7 +2097,6 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 #[cfg(any(windows, test))]
 fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Option<u64>) -> u64 {
     const DEFAULT_MOST: u64 = 3072 << 20;
-    const SMALL_BUDGET_CEILING: u64 = 9 << 30;
     if let Some(mb) = override_mb {
         return mb.min(8192) << 20;
     }
@@ -1965,13 +2109,7 @@ fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Option<u64>) -
 #[cfg(windows)]
 pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let override_mb = *OVERRIDE_MB.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    });
-    let most = targets_room_kept_bytes(vram_budget, override_mb);
+    let most = targets_most(vram_budget);
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let settle = *SETTLE.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS")
@@ -1979,8 +2117,7 @@ pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(20_000)
     });
-    // Every host texture's bytes less those of the copies the title fills.
-    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    let targets = targets_now();
     // The targets' bytes at their last change of 64 MiB or more, and when
     // they last grew by that much.
     static GREW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2022,26 +2159,33 @@ fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
 
 /// What [`room`] weighs now, in MB, for the log: the card's budget, its
 /// use, the free part of the texture blocks, what is kept for card copies
-/// of title buffers and for render targets, and the line. `None` without
-/// the system's numbers, or under `VICTORY_TEXTURE_BUDGET_MB` (which
-/// weighs the textures' own bytes instead).
+/// of title buffers and for render targets, and the line; then what it
+/// comes to ([`weighed`]: more than those terms' sum while no block of
+/// textures can be made), what is still to come of render targets
+/// ([`targets_to_come`]), and whether the card has room for a new block
+/// ([`block_room`]; 1 or 0). `None` without the system's numbers, or under
+/// `VICTORY_TEXTURE_BUDGET_MB` (which weighs the textures' own bytes
+/// instead).
 #[cfg(windows)]
-pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
+pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 9]> {
     if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
         return None;
     }
     let [budget, used, ..] = memory?;
-    Some(
-        [
-            budget,
-            used,
-            crate::pool::texture_room(),
-            crate::shadow::card_room_kept(),
-            targets_room_kept(Some(budget)),
-            room_line(budget),
-        ]
-        .map(|bytes| bytes >> 20),
-    )
+    let mut terms = [
+        budget,
+        used,
+        crate::pool::texture_room(),
+        crate::shadow::card_room_kept(),
+        targets_room_kept(Some(budget)),
+        room_line(budget),
+        weighed(budget, used),
+        targets_to_come(Some(budget)),
+        0,
+    ]
+    .map(|bytes| bytes >> 20);
+    terms[8] = u64::from(block_room(memory));
+    Some(terms)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2371,12 +2515,7 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept(Some(budget));
-            crate::host::vram_keep_below(budget, used, room_line(budget))
-        }
+        Some([budget, used, ..]) if keep => crate::host::vram_keep_below(budget, weighed(budget, used), room_line(budget)),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
@@ -3083,6 +3222,12 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
         return Some(t);
+    }
+    // No block has a place for it and the card has no room for a new one
+    // (`crate::pool::gate`), and it can wait: not made with memory of its
+    // own either, which would be the card's memory all the same.
+    if crate::pool::waits() {
+        return None;
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -5252,6 +5397,68 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+    }
+
+    /// A block of textures is made only while the card's whole use, with
+    /// the block and what is still to come, stays within the line; and
+    /// while none can be made the free part of the blocks is what the queue
+    /// and the sweep go by.
+    #[test]
+    fn a_block_of_textures_wants_room_for_itself_and_for_what_is_to_come() {
+        const MB: u64 = 1 << 20;
+        // Run 423, 19:14:53: 8,909 MB in use, a line of 9,286, and the
+        // reserve for targets given up: a block fitted, and 1,681 MB of
+        // them were made in five seconds.
+        assert!(block_fits(8909 * MB, 0, 9286 * MB));
+        // With what was still to come of render targets (3,072 - 1,931).
+        assert!(!block_fits(8909 * MB, 1141 * MB, 9286 * MB));
+        // To the byte.
+        assert!(block_fits(1000 * MB, 100 * MB, 1164 * MB));
+        assert!(!block_fits(1000 * MB, 100 * MB, 1164 * MB - 1));
+        // No block can be made: room while more than a block's worth is
+        // free in the blocks there are, whatever the card's use says.
+        let line = 9520 * MB;
+        assert!(blocks_full(line, 65 * MB) < line);
+        assert!(blocks_full(line, 64 * MB) >= line);
+        assert!(blocks_full(line, 0) >= line);
+        // And the sweep (2 % under the line: none go; from there idle ones
+        // go until 5 % under it) keeps 2 to 5 % of the budget and a block
+        // free in them.
+        let budget = 10288 * MB;
+        let step = budget / 100;
+        let none_go = |free: u64| crate::host::vram_keep_below(budget, blocks_full(line, free), line).1 == u64::MAX;
+        assert!(none_go(64 * MB + 2 * step + MB));
+        assert!(!none_go(64 * MB + 2 * step));
+        assert_eq!(crate::host::vram_keep_below(budget, blocks_full(line, 64 * MB + 2 * step), line).1, 3 * step);
+        assert_eq!(crate::host::vram_keep_below(budget, blocks_full(line, 0), line).1, 64 * MB + 5 * step);
+    }
+
+    /// An arena or loose range of title memory by address goes to the card
+    /// only while the render targets still to come have room beside it.
+    #[test]
+    fn title_memory_by_address_leaves_room_for_the_targets_to_come() {
+        const MB: u64 = 1 << 20;
+        let budget = 10290 * MB;
+        // Under 97 hundredths of the budget (9,981 MB) with nothing to come.
+        assert!(by_address_fits(budget, 9900 * MB, 64 * MB, 0, 97));
+        assert!(!by_address_fits(budget, 9920 * MB, 64 * MB, 0, 97));
+        // With 1,141 MB of targets to come (run 423, 19:15:04): up to 8,775 MB.
+        assert!(by_address_fits(budget, 8700 * MB, 64 * MB, 1141 * MB, 97));
+        assert!(!by_address_fits(budget, 8800 * MB, 64 * MB, 1141 * MB, 97));
+        // On <= 9 GiB cards (`pct = 88`): under 88 % of 8,000 MB (7,040 MB).
+        assert!(by_address_fits(8000 * MB, 6000 * MB, 64 * MB, 900 * MB, 88));
+        assert!(!by_address_fits(8000 * MB, 6100 * MB, 64 * MB, 900 * MB, 88));
+    }
+
+    #[test]
+    fn targets_to_come_settles_on_8gb_cards_only() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(targets_to_come_bytes(Some(6 * GIB), 1536 * MIB, 1100 * MIB, 0), 0);
+        assert_eq!(targets_to_come_bytes(Some(8 * GIB), 2048 * MIB, 1100 * MIB, 450 * MIB), 450 * MIB);
+        assert_eq!(targets_to_come_bytes(Some(8 * GIB), 2048 * MIB, 1100 * MIB, 0), 0);
+        assert_eq!(targets_to_come_bytes(Some(12 * GIB), 3072 * MIB, 1931 * MIB, 0), 1141 * MIB);
+        assert_eq!(targets_to_come_bytes(None, 3072 * MIB, 1931 * MIB, 0), 1141 * MIB);
     }
 
     /// The room kept for render targets goes once the world's targets are
