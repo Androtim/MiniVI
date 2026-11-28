@@ -2408,14 +2408,13 @@ impl<T> ReadbackPool<T> {
     fn trim(&self) -> u64 {
         let (freed, bytes) = {
             let (idle, stats) = &mut *self.0.lock().unwrap_or_else(|e| e.into_inner());
-            if idle.kept.is_empty() {
+            let freed = idle.trim();
+            if freed.is_empty() {
                 return 0;
             }
-            let bytes = idle.bytes;
-            idle.bytes = 0;
-            idle.low = 0;
-            stats.idle_bytes = 0;
-            (std::mem::take(&mut idle.kept), bytes)
+            let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+            stats.idle_bytes = idle.bytes;
+            (freed, bytes)
         };
         drop(freed);
         bytes
@@ -2562,12 +2561,23 @@ mod readback_pool_tests {
             })
             .unwrap();
         drop(a);
-        assert_eq!(pool.trim(), CLASS);
+        // First trim establishes the low watermark without evicting actively used pools.
         assert_eq!(pool.trim(), 0);
+        // Second trim with no reuse across the window frees the unused idle buffer.
+        assert_eq!(pool.trim(), CLASS);
         assert_eq!(*b.resource(), 2);
         let stats = b.stats();
         assert_eq!((stats.idle_bytes, stats.active_buffers, stats.active_bytes), (0, 1, CLASS));
+
+        // Cycling a buffer through take/drop resets the low watermark so the next trim keeps it.
         drop(b);
+        assert_eq!(pool.trim(), 0);
+        let c = pool
+            .take(32 << 10, 2 * CLASS, |_| unreachable!("active pool should hit cache"))
+            .unwrap();
+        assert_eq!(*c.resource(), 2);
+        drop(c);
+        assert_eq!(pool.trim(), 0);
         let stats = pool.0.lock().unwrap().1;
         assert_eq!((stats.idle_bytes, stats.active_buffers, stats.active_bytes), (CLASS, 0, 0));
     }
