@@ -263,6 +263,11 @@ fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Opti
         return None;
     }
     let host = crate::host::made_host()?;
+    // `decode` parses AMD RDNA 2+ image descriptors; on non-AMD hosts those
+    // bytes are an unrelated vendor descriptor layout.
+    if !crate::indirect::amd(&host.device) {
+        return None;
+    }
     let mut slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_none() {
         // SAFETY: plain heap creation.

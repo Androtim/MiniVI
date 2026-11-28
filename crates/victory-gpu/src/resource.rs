@@ -1792,7 +1792,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // (Not one that only waits for a place in a block,
+            // `crate::pool::waiting`: it is asked for again.)
+            if !crate::pool::waits() {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -1909,14 +1913,94 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept(Some(budget))
-                < room_line(budget)
-        }
+        Some([budget, used, ..]) => weighed(budget, used) < room_line(budget),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// What [`room`] and the sweep ([`let_go_idle`]) weigh against the line, in
+/// bytes of a budget of `budget` with `used` in use: the card's use less
+/// the free part of the texture blocks, with what is kept for buffer copies
+/// and render targets, and at least [`blocks_full`] when no block may be made.
+#[cfg(windows)]
+fn weighed(budget: u64, used: u64) -> u64 {
+    let free = crate::pool::texture_room();
+    let by_use = used.saturating_sub(free) + crate::shadow::card_room_kept() + targets_room_kept(Some(budget));
+    if crate::pool::gate() && !block_room(Some([budget, used, 0, 0])) {
+        by_use.max(blocks_full(room_line(budget), free))
+    } else {
+        by_use
+    }
+}
+
+/// What is weighed against `line` while no block of textures can be made,
+/// with `free` bytes free in the blocks there are.
+#[cfg(any(windows, test))]
+fn blocks_full(line: u64, free: u64) -> u64 {
+    (line + POOL_BLOCK).saturating_sub(free)
+}
+
+/// A block of textures (`crate::pool`).
+#[cfg(any(windows, test))]
+const POOL_BLOCK: u64 = 64 << 20;
+
+/// Whether the card has room for one more block of textures (`crate::pool::gate`).
+#[cfg(windows)]
+pub(crate) fn block_room(memory: Option<[u64; 4]>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some([budget, used, ..]) = memory else {
+        return true;
+    };
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let room = filled < texture_floor_bytes(Some(budget))
+        || block_fits(used, crate::shadow::card_room_kept() + targets_to_come(Some(budget)), room_line(budget));
+    crate::pool::note_full(!room);
+    room
+}
+
+/// [`block_room`]'s sum: `used` bytes in use and `kept` to come, with one
+/// more block, within `line`.
+#[cfg(any(windows, test))]
+fn block_fits(used: u64, kept: u64, line: u64) -> bool {
+    used + kept + POOL_BLOCK <= line
+}
+
+/// Whether `len` more bytes of title memory by address (an arena of 64 MiB)
+/// fit under `pct` hundredths of `budget` leaving room for render targets to come.
+#[cfg(windows)]
+pub(crate) fn by_address_room(budget: u64, used: u64, len: u64, pct: u64) -> bool {
+    by_address_fits(budget, used, len, targets_to_come(Some(budget)), pct)
+}
+
+#[cfg(any(windows, test))]
+fn by_address_fits(budget: u64, used: u64, len: u64, to_come: u64, pct: u64) -> bool {
+    used.saturating_add(len).saturating_add(to_come) < budget / 100 * pct
+}
+
+/// The bytes of render targets and other host copies the host itself writes
+/// that are still to come ([`targets_most`] less [`targets_now`]).
+#[cfg(windows)]
+pub(crate) fn targets_to_come(vram_budget: Option<u64>) -> u64 {
+    targets_most(vram_budget).saturating_sub(targets_now())
+}
+
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_MB` in bytes, or VRAM-scaled default.
+#[cfg(windows)]
+fn targets_most(vram_budget: Option<u64>) -> u64 {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    targets_room_kept_bytes(vram_budget, override_mb)
+}
+
+/// Every host texture's bytes less those of the copies the title fills.
+#[cfg(windows)]
+fn targets_now() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed))
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1965,13 +2049,7 @@ fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Option<u64>) -
 #[cfg(windows)]
 pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let override_mb = *OVERRIDE_MB.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    });
-    let most = targets_room_kept_bytes(vram_budget, override_mb);
+    let most = targets_most(vram_budget);
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let settle = *SETTLE.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS")
@@ -1979,8 +2057,7 @@ pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(20_000)
     });
-    // Every host texture's bytes less those of the copies the title fills.
-    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    let targets = targets_now();
     // The targets' bytes at their last change of 64 MiB or more, and when
     // they last grew by that much.
     static GREW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2026,22 +2103,25 @@ fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
 /// the system's numbers, or under `VICTORY_TEXTURE_BUDGET_MB` (which
 /// weighs the textures' own bytes instead).
 #[cfg(windows)]
-pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
+pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 9]> {
     if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
         return None;
     }
     let [budget, used, ..] = memory?;
-    Some(
-        [
-            budget,
-            used,
-            crate::pool::texture_room(),
-            crate::shadow::card_room_kept(),
-            targets_room_kept(Some(budget)),
-            room_line(budget),
-        ]
-        .map(|bytes| bytes >> 20),
-    )
+    let mut terms = [
+        budget,
+        used,
+        crate::pool::texture_room(),
+        crate::shadow::card_room_kept(),
+        targets_room_kept(Some(budget)),
+        room_line(budget),
+        weighed(budget, used),
+        targets_to_come(Some(budget)),
+        0,
+    ]
+    .map(|bytes| bytes >> 20);
+    terms[8] = u64::from(block_room(memory));
+    Some(terms)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2371,12 +2451,7 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept(Some(budget));
-            crate::host::vram_keep_below(budget, used, room_line(budget))
-        }
+        Some([budget, used, ..]) if keep => crate::host::vram_keep_below(budget, weighed(budget, used), room_line(budget)),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
@@ -3083,6 +3158,11 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
         return Some(t);
+    }
+    // No block has a place for it and the card has no room for a new one
+    // (`crate::pool::gate`), and it can wait: not made with memory of its own.
+    if crate::pool::waits() {
+        return None;
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -5310,6 +5390,37 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_block_of_textures_wants_room_for_itself_and_for_what_is_to_come() {
+        const MB: u64 = 1 << 20;
+        assert!(block_fits(8909 * MB, 0, 9286 * MB));
+        assert!(!block_fits(8909 * MB, 1141 * MB, 9286 * MB));
+        assert!(block_fits(1000 * MB, 100 * MB, 1164 * MB));
+        assert!(!block_fits(1000 * MB, 100 * MB, 1164 * MB - 1));
+        let line = 9520 * MB;
+        assert!(blocks_full(line, 65 * MB) < line);
+        assert!(blocks_full(line, 64 * MB) >= line);
+        assert!(blocks_full(line, 0) >= line);
+        let budget = 10288 * MB;
+        let step = budget / 100;
+        let none_go = |free: u64| crate::host::vram_keep_below(budget, blocks_full(line, free), line).1 == u64::MAX;
+        assert!(none_go(64 * MB + 2 * step + MB));
+        assert!(!none_go(64 * MB + 2 * step));
+        assert_eq!(crate::host::vram_keep_below(budget, blocks_full(line, 64 * MB + 2 * step), line).1, 3 * step);
+        assert_eq!(crate::host::vram_keep_below(budget, blocks_full(line, 0), line).1, 64 * MB + 5 * step);
+    }
+
+    #[test]
+    fn title_memory_by_address_leaves_room_for_the_targets_to_come() {
+        const MB: u64 = 1 << 20;
+        let budget = 10290 * MB;
+        assert!(by_address_fits(budget, 9900 * MB, 64 * MB, 0, 97));
+        assert!(!by_address_fits(budget, 9920 * MB, 64 * MB, 0, 97));
+        assert!(by_address_fits(budget, 8700 * MB, 64 * MB, 1141 * MB, 97));
+        assert!(!by_address_fits(budget, 8800 * MB, 64 * MB, 1141 * MB, 97));
+        assert!(!by_address_fits(budget, 8000 * MB, 64 * MB, 1500 * MB, 90));
     }
 
     #[test]
