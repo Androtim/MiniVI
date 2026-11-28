@@ -5646,8 +5646,27 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The card has run every flight given here (`relay_worker` takes only
+        // those the host's fence says are done), so nothing reads the dynamic
+        // descriptor slots of their lists' tables any more: they are given
+        // back now, not after the copies back below (15 to 30 ms of a frame at
+        // 9,000 draws, 54 to 143 ms while a place loads).
+        let mut gave = false;
+        for item in &mut items {
+            if let Late::Run(flight) = item {
+                for detached in &mut flight.lists {
+                    detached.release_tables();
+                }
+                gave |= !flight.lists.is_empty();
+            }
+        }
+        if gave {
+            // (A draw waiting for slots looks again: `wait_for_slots`.)
+            LINE_LANDED.notify_all();
+            crate::list::thin::moved();
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
