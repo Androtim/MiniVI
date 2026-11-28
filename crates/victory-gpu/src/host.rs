@@ -2683,23 +2683,138 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// since the start.
 pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// Drops spare scratch chunks and list upload buffers kept idle when host
+/// memory is pressured.
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
-            return;
+            Vec::new()
+        } else {
+            spare.bytes = 0;
+            spare.low = 0;
+            std::mem::take(&mut spare.kept)
         }
-        spare.bytes = 0;
-        spare.low = 0;
-        std::mem::take(&mut spare.kept)
     };
-    let count = freed.len() as u64;
-    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
-    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
-    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    if !freed.is_empty() {
+        let count = freed.len() as u64;
+        let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+        ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+        ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+        drop(freed);
+    }
+    for shared in [false, true] {
+        let freed_uploads = {
+            let mut spare = spare_list_pool(shared).lock().unwrap_or_else(|e| e.into_inner());
+            if spare.kept.is_empty() {
+                Vec::new()
+            } else {
+                spare.bytes = 0;
+                spare.low = 0;
+                std::mem::take(&mut spare.kept)
+            }
+        };
+        drop(freed_uploads);
+    }
+}
+
+const LIST_UPLOAD_MIN: u64 = 64 << 10;
+const LIST_UPLOAD_MAX: u64 = 16 << 20;
+const LIST_UPLOAD_SPARE_MOST: u64 = 64 << 20;
+
+static SPARE_LIST_UPLOAD: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+static SPARE_LIST_SHARED_UPLOAD: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+
+fn spare_list_pool(shared: bool) -> &'static Mutex<Spare<Chunk>> {
+    if shared {
+        &SPARE_LIST_SHARED_UPLOAD
+    } else {
+        &SPARE_LIST_UPLOAD
+    }
+}
+
+fn list_upload_class(size: u64) -> Option<u64> {
+    size.max(1)
+        .max(LIST_UPLOAD_MIN)
+        .checked_next_power_of_two()
+        .filter(|&bytes| bytes <= LIST_UPLOAD_MAX)
+}
+
+/// A mapped list upload buffer for `size` bytes (`shared` when `card_steps`
+/// may fill it), reused from the idle pool or allocated fresh.
+fn take_list_upload(host: &Host, size: u64, shared: bool) -> Option<(Chunk, u64)> {
+    let size = size.max(1);
+    let class = list_upload_class(size);
+    if scratch_pool()
+        && let Some(bytes) = class
+        && let Some(chunk) = spare_list_pool(shared)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(bytes)
+    {
+        return Some((chunk, bytes));
+    }
+    let allocate = |bytes| {
+        if shared {
+            host.shared_buffer(bytes)
+        } else {
+            host.upload_buffer(bytes)
+        }
+    };
+    let (capacity, buffer, data) = match class {
+        Some(bytes) => match allocate(bytes) {
+            Some((buffer, data)) => (bytes, buffer, data),
+            None if bytes != size => {
+                let (buffer, data) = allocate(size)?;
+                (size, buffer, data)
+            }
+            None => return None,
+        },
+        None => {
+            let (buffer, data) = allocate(size)?;
+            (size, buffer, data)
+        }
+    };
+    name(&buffer, || {
+        let kind = if shared { "list shared upload" } else { "list upload" };
+        format!("{kind} {capacity:#x}")
+    });
+    Some((
+        Chunk {
+            buffer,
+            data: data as usize,
+        },
+        capacity,
+    ))
+}
+
+/// Returns list upload buffers whose fence has completed to the per-kind pool,
+/// dropping oversized or overflowing buffers outside the pool lock.
+fn give_list_uploads(uploads: Vec<(Chunk, u64, bool)>) {
+    if uploads.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    let limit = if crate::residency::limited_host_ram() {
+        LIST_UPLOAD_SPARE_MOST / 4
+    } else {
+        LIST_UPLOAD_SPARE_MOST
+    };
+    for (chunk, size, shared) in uploads {
+        if scratch_pool() && (LIST_UPLOAD_MIN..=LIST_UPLOAD_MAX).contains(&size) && size.is_power_of_two() {
+            let back = spare_list_pool(shared)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .give(chunk, size, limit);
+            if let Some(chunk) = back {
+                freed.push(chunk);
+            }
+        } else {
+            freed.push(chunk);
+        }
+    }
     drop(freed);
 }
 
@@ -2979,11 +3094,15 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
+    /// Pooled mapped upload buffers from [`HostList::upload`]: chunk, capacity, shared flag.
+    list_uploads: Vec<(Chunk, u64, bool)>,
     /// Title textures whose upload the list's prelude records if the check at
     /// submission finds it due (`crate::texture::prelude_uploads`).
     prelude_uploads: Vec<crate::texture::PreludeUpload>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
+    /// The bytes of `list_uploads` (counted in [`ALIVE`] while they are held).
+    list_upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -3035,6 +3154,15 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// Holds a pooled upload `chunk` (`size` bytes, `shared` when `card_steps`
+    /// may fill it) until the list is reset.
+    fn hold_list_upload(&mut self, chunk: Chunk, size: u64, shared: bool) {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(size, Ordering::Relaxed);
+        self.list_upload_bytes += size;
+        self.list_uploads.push((chunk, size, shared));
+    }
+
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
@@ -3049,6 +3177,9 @@ impl Drop for Deferred {
         give_chunks(std::mem::take(&mut self.plane_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        ALIVE[6].fetch_sub(self.list_uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.list_upload_bytes, Ordering::Relaxed);
+        give_list_uploads(std::mem::take(&mut self.list_uploads));
     }
 }
 
@@ -7812,6 +7943,7 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.list_uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -7972,14 +8104,14 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset, reused from the per-kind idle pool when within class bounds.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let shared = card_steps::stage() > 1;
+        let (chunk, capacity) = take_list_upload(host, size, shared)?;
+        let buffer = chunk.buffer.clone();
+        let data = chunk.data as *mut u8;
+        self.deferred().hold_list_upload(chunk, capacity, shared);
         Some((buffer, data))
     }
 
@@ -12293,6 +12425,84 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod list_upload_pool_tests {
+    use super::*;
+
+    #[test]
+    fn list_upload_class_rounds_to_power_of_two_bounds() {
+        assert_eq!(list_upload_class(0), Some(LIST_UPLOAD_MIN));
+        assert_eq!(list_upload_class(1), Some(LIST_UPLOAD_MIN));
+        assert_eq!(list_upload_class(LIST_UPLOAD_MIN), Some(LIST_UPLOAD_MIN));
+        assert_eq!(list_upload_class(LIST_UPLOAD_MIN + 1), Some(LIST_UPLOAD_MIN * 2));
+        assert_eq!(list_upload_class(LIST_UPLOAD_MAX), Some(LIST_UPLOAD_MAX));
+        assert_eq!(list_upload_class(LIST_UPLOAD_MAX + 1), None);
+    }
+
+    #[test]
+    fn host_list_upload_pools_buffers_by_shared_kind_until_reset() {
+        let host = host().expect("D3D12 is needed for the list upload pool test");
+        trim_spare_chunks();
+
+        // Warm both shared=false and shared=true with distinct list lifetimes so
+        // an in-use buffer stays exclusive and reset returns it for reuse.
+        let list_a = host.new_list().unwrap();
+        let (buf_a, ptr_a) = list_a.upload(host, 96 << 10).unwrap();
+        assert!(!ptr_a.is_null());
+        assert!(!list_a.untouched());
+        let raw_a = buf_a.as_raw();
+
+        let (shared_a, shared_ptr) = {
+            let (chunk, cap) = take_list_upload(host, 96 << 10, true).unwrap();
+            assert_eq!(cap, 128 << 10);
+            let raw = chunk.buffer.as_raw();
+            let ptr = chunk.data as *mut u8;
+            give_list_uploads(vec![(chunk, cap, true)]);
+            (raw, ptr)
+        };
+        assert!(!shared_ptr.is_null());
+
+        // Resetting `list_a` after closing returns `raw_a` to the non-shared pool;
+        // taking from the shared pool gets `shared_a`, while a new list gets `raw_a`.
+        drop(buf_a);
+        list_a.close();
+        list_a.reset();
+        let (shared_b, cap_b) = take_list_upload(host, 100 << 10, true).unwrap();
+        assert_eq!(cap_b, 128 << 10);
+        assert_eq!(shared_b.buffer.as_raw(), shared_a);
+        assert_ne!(shared_b.buffer.as_raw(), raw_a);
+
+        let list_b = host.new_list().unwrap();
+        let (buf_b, _) = list_b.upload(host, 80 << 10).unwrap();
+        assert_eq!(buf_b.as_raw(), raw_a);
+
+        // Oversized (> 16 MiB) uploads bypass pooling cleanly.
+        let list_big = host.new_list().unwrap();
+        let (big_a, _) = list_big.upload(host, LIST_UPLOAD_MAX + 4096).unwrap();
+        let raw_big = big_a.as_raw();
+        drop(big_a);
+        list_big.close();
+        list_big.reset();
+        let list_big2 = host.new_list().unwrap();
+        let (big_b, _) = list_big2.upload(host, LIST_UPLOAD_MAX + 4096).unwrap();
+        drop((buf_b, big_b, shared_b));
+        list_b.close();
+        list_b.reset();
+        list_big2.close();
+        list_big2.reset();
+        assert!(raw_big as usize != 0);
+
+        // Trimming empties both idle upload pools cleanly.
+        assert!(
+            !SPARE_LIST_UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).kept.is_empty()
+                || !SPARE_LIST_SHARED_UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).kept.is_empty()
+        );
+        trim_spare_chunks();
+        assert!(SPARE_LIST_UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).kept.is_empty());
+        assert!(SPARE_LIST_SHARED_UPLOAD.lock().unwrap_or_else(|e| e.into_inner()).kept.is_empty());
     }
 }
 
