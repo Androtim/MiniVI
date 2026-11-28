@@ -1005,7 +1005,10 @@ fn emit_program(
     });
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
     match again {
-        Ok((shader, Some(w))) if w <= *wave => {
+        // Only take the host-wide-loop pass when it fits the host wave size;
+        // when it still requires wave64 on a 32-lane host, fall through so
+        // `lower::set_needs(needs)` restores the blocked blocks for `widen()`.
+        Ok((shader, Some(w))) if w <= *wave && w <= lower::host_max_wave() => {
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }
