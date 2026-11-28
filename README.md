@@ -33,12 +33,13 @@
 
 ---
 
-## 8 GB VRAM / 16–32 GB RAM Hardening (MiniVI Layer)
+## VRAM-Scaled & 8 GB / 16–32 GB RAM Hardening (MiniVI Layer)
 
-- **Reserved Mip Streaming & Reclaim (`tiles.rs`, `texture.rs`, `resource.rs`):** Enables `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_LEVELS_ALL=1`, `VICTORY_LEVELS_MAX_DIM`, `VICTORY_LEVELS_RECLAIM=1` (returning unheld standard tiles via `retire`), `256 KiB` tile floor on `<= 9 GiB` GPUs, and optional `VICTORY_TEXTURE_MIP_DROP`.
+- **Automatic VRAM Tiering (`play-minivi.ps1`, `resource.rs`, `memory.rs`, `shadow.rs`):** `scripts/play-minivi.ps1` defaults to `-Build release` and auto-detects dedicated VRAM: GPUs with `<= 9 GiB` enable strict mip streaming & reclaim (`VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_LEVELS_ALL=1`, `VICTORY_LEVELS_MAX_DIM`, `VICTORY_LEVELS_RECLAIM=1`) with `1024 MiB` card buffers and `512 MiB` target headroom, while `> 9 GiB` GPUs (`-HighVram` / auto) keep full mip chains (`VICTORY_LEVELS_ON_DEMAND=0`) and let the engine's VRAM-scaled budgets expand naturally. Use `-LowVram` to force the 8 GB profile on any card.
+- **Reserved Mip Streaming & Reclaim (`tiles.rs`, `texture.rs`, `resource.rs`):** Supports `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_LEVELS_ALL=1`, `VICTORY_LEVELS_MAX_DIM`, `VICTORY_LEVELS_RECLAIM=1` (returning unheld standard tiles via `retire`), `256 KiB` tile floor on `<= 9 GiB` GPUs, and optional `VICTORY_TEXTURE_MIP_DROP`.
 - **VRAM-Scaled Headroom (`resource.rs`, `memory.rs`, `shadow.rs`):** Caps reserved render-target headroom at `<= budget / 4` on `<= 9 GiB` cards while preserving upstream settle decay (`targets_seen`/`targets_kept`), scales address-indexed RT/BVH page limits (`most_pages_for`, `spare_pages_for`, `VICTORY_BVH_FAULTS_ALL`), and scales card-memory shadow budgets (`memory_card_budget`).
-- **Bounded Host Pools & RAM Pressure Trimming (`host.rs`, `list.rs`, `shadow.rs`, `texback.rs`):** Adds bounded `ReadbackPool` (`VICTORY_READBACK_POOL=1`, `VICTORY_READBACK_POOL_MB=64`), RAM-aware CPU snapshot pooling (`snapshot_pool_bytes`, `trim_snapshot_pool`), and idle command-list pool trimming (`trim_on_pressure`, `VICTORY_LIST_POOL_MOST`) under `residency::pressured()`.
-- **Watchdog & Shader Completeness (`victory-loader`, `victory-shader`):** Disarms the title hang watchdog (`VICTORY_NO_WATCHDOG=1`), preserves full hair/lighting/world shader coverage alongside upstream `VICTORY_EARLY_DEPTH=1`, `VICTORY_AMBIENT_SPECULAR=1`, and `VICTORY_LEAVE_OUT`, fixes `-1` BVH instance/procedural returns, and allowlists 6 validated `group=64` culling and volumetric water compute kernels for wave32.
+- **Bounded Host Pools & RAM Pressure Trimming (`host.rs`, `list.rs`, `shadow.rs`, `texback.rs`, `descriptor/host.rs`):** Adds bounded `ReadbackPool` (`VICTORY_READBACK_POOL=1`, `VICTORY_READBACK_POOL_MB`), RAM-aware CPU snapshot pooling (`snapshot_pool_bytes`, `trim_snapshot_pool`), idle command-list pool trimming (`trim_on_pressure`, `VICTORY_LIST_POOL_MOST`), and expanded dynamic descriptor headroom on 1M-capped heaps (`VICTORY_DYNAMIC_SLOTS`).
+- **Watchdog & Shader Completeness (`victory-loader`, `victory-shader`):** Disarms the title hang watchdog (`VICTORY_NO_WATCHDOG=1`), preserves full hair/lighting/world shader coverage alongside upstream `VICTORY_EARLY_DEPTH=1`, `VICTORY_AMBIENT_SPECULAR=1`, and `VICTORY_LEAVE_OUT`, fixes `-1` BVH instance/procedural returns, and widens acyclic single-wave (`group=64`) compute shaders (plus validated culling & volumetric water kernels) for Wave32 hosts.
 
 ---
 
@@ -46,9 +47,9 @@
 
 ### Build
 ```powershell
-cargo build --locked --profile diag --features diagnostics -p victory
-# Or release:
 cargo build --locked --release -p victory
+# Or diagnostics build (adds DRED & verbose telemetry):
+cargo build --locked --profile diag --features diagnostics -p victory
 # Optional Windows 10 Agility SDK + NVIDIA DLSS / AMD FSR3 DLLs:
 .\scripts\get-nvidia-sdks.ps1
 ```
@@ -60,9 +61,9 @@ cargo build --locked --release -p victory
 ```powershell
 $env:VICTORY_EARLY_DEPTH = '1'
 $env:VICTORY_NAN_SCRUB = '1'
-.\target\diag\victory.exe shaders D:\Path\To\YourDump
+.\target\release\victory.exe shaders D:\Path\To\YourDump
 
-# Launch 720p Series S + DLSS Quality (add -FrameGen 2x for 2x DLSS FG):
+# Launch Series S 720p + DLSS Quality (auto-selects VRAM tier & CPU worker pools; add -FrameGen auto or -Preload):
 .\scripts\play-minivi.ps1 -Exe 'D:\Path\To\YourDump\game_scarlett_master.exe' -Preset balanced-720p -Dlss quality
 ```
 

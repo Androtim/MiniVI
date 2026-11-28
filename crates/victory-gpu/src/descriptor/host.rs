@@ -1957,6 +1957,24 @@ pub(crate) fn probe_view_limit() {
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
+/// Minimum title slots kept available when expanding dynamic slots on a capped heap.
+const MIN_TITLE_SLOTS: u32 = 1 << 19;
+/// Default dynamic descriptor count on capped (`< PORTABLE_VIEWS`) heaps:
+/// `DYNAMIC + 16,384` leaves ~721k title slots on a 1M NVIDIA heap while
+/// preventing "no free dynamic descriptor slots" drops in dense scenes.
+const CAPPED_DEFAULT_DYNAMIC: u32 = DYNAMIC + (1 << 14);
+
+/// Pure calculation of dynamic descriptor slots for a view heap of `count`
+/// title slots ending at `null`, honoring `VICTORY_DYNAMIC_SLOTS` overrides
+/// safely on both capped (NVIDIA 1M) and large heaps.
+fn resolve_dynamic_slots(count: u32, null: u32, override_slots: Option<u32>) -> u32 {
+    if null < PORTABLE_VIEWS {
+        let max_safe = null.saturating_sub(MIN_TITLE_SLOTS).max(DYNAMIC);
+        return override_slots.map_or(CAPPED_DEFAULT_DYNAMIC.min(max_safe), |req| req.clamp(DYNAMIC, max_safe));
+    }
+    let most = override_slots.unwrap_or(DYNAMIC << 2);
+    null.saturating_sub(count).min(most).max(DYNAMIC)
+}
 
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
@@ -1965,17 +1983,13 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static MOST: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let override_slots = *MOST.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
-    if null < PORTABLE_VIEWS {
-        return DYNAMIC;
-    }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    resolve_dynamic_slots(count, null, override_slots)
 }
 
 impl HostHeap {
@@ -7103,5 +7117,19 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+
+    #[test]
+    fn resolve_dynamic_slots_expands_safely_and_honors_override() {
+        // NVIDIA 1M view heap (`null = 999_999 < PORTABLE_VIEWS`):
+        // default expands beyond 2^18 (`DYNAMIC`) while preserving > 720k title slots.
+        assert_eq!(resolve_dynamic_slots(700_000, 999_999, None), DYNAMIC + (1 << 14));
+        // Explicit override works up to `null - MIN_TITLE_SLOTS`, and clamps below `DYNAMIC`.
+        assert_eq!(resolve_dynamic_slots(700_000, 999_999, Some(300_000)), 300_000);
+        assert_eq!(resolve_dynamic_slots(700_000, 999_999, Some(900_000)), 999_999 - MIN_TITLE_SLOTS);
+        assert_eq!(resolve_dynamic_slots(700_000, 999_999, Some(1024)), DYNAMIC);
+        // Large heap (`null >= PORTABLE_VIEWS`) uses up to `DYNAMIC << 2` or explicit override.
+        assert_eq!(resolve_dynamic_slots(700_000, 2_000_000, None), DYNAMIC << 2);
+        assert_eq!(resolve_dynamic_slots(700_000, 2_000_000, Some(600_000)), 600_000);
     }
 }
