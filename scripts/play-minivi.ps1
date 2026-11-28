@@ -302,6 +302,7 @@ foreach ($k in $menu.Keys) {
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 # F1 menu metadata so "Save and restart" / "Preload shaders" work cleanly.
+$Exe = (Resolve-Path $Exe).Path
 $menuFgType = if ($FrameGenType -eq 'fsr3') { 'fsr' } else { $FrameGenType }
 $settings.VICTORY_MENU_CONSOLE = $Console
 $settings.VICTORY_MENU_RES = if ($Console -eq 'series-s') { '1080to1440' } else { '1440' }
@@ -309,7 +310,9 @@ $settings.VICTORY_MENU_FG_TYPE = $menuFgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Preset $Preset -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
+$settings.VICTORY_MENU_EXE = $Exe
+$settings.VICTORY_MENU_CWD = $PWD.ProviderPath
+$settings.VICTORY_MENU_ARGS = "-Exe `$env:VICTORY_MENU_EXE -Preset $Preset -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
 
 $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'target' }
 $victory = Join-Path $targetRoot "$Build\victory.exe"
@@ -335,7 +338,6 @@ $keep = 'VICTORY_HOME', 'VICTORY_ADAPTER', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR',
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $keep } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
-$Exe = (Resolve-Path $Exe).Path
 $vramLabel = if ($isLowVram) { "low-VRAM (<=9 GiB, max mip ${maxDim}px)" } else { "high-VRAM (>9 GiB, full mips)" }
 $fgLabel = if ($fgTimes -ge 2) { "${fgTimes}x" } else { 'off' }
 Write-Host "MiniVI ($Preset, $Build, $Console, DLSS=$Dlss, FG=$fgLabel, $vramLabel, ${cpus} CPUs)"
