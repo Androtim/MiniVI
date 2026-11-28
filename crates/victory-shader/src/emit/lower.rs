@@ -24,6 +24,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+/// DexNom PR 62's size handle (AMD compiler crash on RDNA 4).
+#[path = "lower/amd.rs"]
+pub(super) mod amd;
 
 type Why = &'static str;
 
@@ -141,6 +144,16 @@ const ORDERED_PS_DONE: u16 = 7;
 const POPS_PACKER: u16 = 25;
 /// The operand `src_pops_exiting_wave_id`.
 const POPS_EXITING: u8 = 239;
+
+/// Whether pixel float colour outputs are held to the console's HDR range
+/// `[-65024, 65024]` (`VICTORY_HDR_CLAMP=0`: off). From aki-gta6/aki-runtime
+/// 01f6f31 via ProjectLeonida/mandy 1411b6c.
+fn hdr_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HDR_CLAMP").is_none_or(|v| v != "0"))
+}
+
+const HDR_MAX: f32 = 65024.0;
 
 /// The instructions inside a pixel program's ordered section
 /// (primitive-ordered pixel shading, which the console compiler makes of
@@ -1711,6 +1724,33 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes.
+pub(super) fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[&crate::resource::Address],
+    lowest: u32,
+) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses
+        .iter()
+        .any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2127,22 +2167,26 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
+                    .collect();
+                let lowest = addresses
+                    .iter()
                     .map(|a| a.offset & !3)
                     .min()
                     .ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -4231,6 +4275,22 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
+    }
+
+    /// Holds a pixel float colour output to `[-65024, 65024]` (`VICTORY_HDR_CLAMP`).
+    /// Prevents >65504 values from becoming `+Inf` in 16-bit float host targets
+    /// (which the title's tonemap turns into black blobs/glitter).
+    fn clamp_hdr(&mut self, f: V) -> V {
+        if !hdr_clamp() {
+            return f;
+        }
+        let c = self.cur;
+        let min = self.s.m.f32((-HDR_MAX).to_bits());
+        let max = self.s.m.f32(HDR_MAX.to_bits());
+        let lo = self.binary(35, f, min); // FMax
+        let hi = self.binary(36, lo, max); // FMin
+        let nan = self.is_nan_f32(f);
+        self.s.m.select(c, nan, max, hi)
     }
 
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
@@ -6453,7 +6513,10 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -6474,6 +6537,52 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(zero));
                     let nonzero = self.s.m.cmp(c, pred::NE, mask, zero);
                     self.set(scc, Val::Bit(nonzero));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    // Every bit of the source twice: bit i of it is bits 2i and
+                    // 2i+1 of the result. Each 16-bit half is spread to the
+                    // even bits of a dword, then doubled.
+                    let a = src32(self, 0)?;
+                    let mut halves = Vec::new();
+                    for shift in [0, 16] {
+                        let (k, m) = (self.s.m.i32(shift), self.s.m.i32(0xFFFF));
+                        let x = self.s.m.bin(c, Bin::LShr, a, k);
+                        let mut x = self.s.m.bin(c, Bin::And, x, m);
+                        for (by, keep) in [(8, 0x00FF_00FF), (4, 0x0F0F_0F0F), (2, 0x3333_3333), (1, 0x5555_5555)] {
+                            let (k, m) = (self.s.m.i32(by), self.s.m.i32(keep));
+                            let up = self.s.m.bin(c, Bin::Shl, x, k);
+                            let both = self.s.m.bin(c, Bin::Or, x, up);
+                            x = self.s.m.bin(c, Bin::And, both, m);
+                        }
+                        let k1 = self.s.m.i32(1);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k1);
+                        halves.push(self.s.m.bin(c, Bin::Or, x, up));
+                    }
+                    self.set(lo, Val::I32(halves[0]));
+                    self.set(hi, Val::I32(halves[1]));
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << src0[5:0]) - 1) << src1[5:0].
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let a = self.s.m.bin(c, Bin::And, a, k63);
+                    let b = self.s.m.bin(c, Bin::And, b, k63);
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let r = self.s.m.bin(c, Bin::Shl, m, b);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
                     Ok(())
                 }
                 "s_bcnt1_i32_b64" => {
@@ -6757,6 +6866,26 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // Two 16-bit halves in one dword, the first operand's in the
+                // low half: both low halves (ll), the first's low and the
+                // second's high (lh), or both high halves (hh).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low_half, high_half) =
+                    (self.s.m.i32(16), self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_0000));
+                let low = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low_half)
+                };
+                let high = if name == "s_pack_ll_b32_b16" {
+                    let b = self.s.m.bin(c, Bin::And, b, low_half);
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, high_half)
+                };
+                (self.s.m.bin(c, Bin::Or, low, high), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -6781,6 +6910,9 @@ impl<'a> Lower<'a> {
                         | "s_brev_b32"
                         | "s_mul_i32"
                         | "s_mulk_i32"
+                        | "s_pack_ll_b32_b16"
+                        | "s_pack_lh_b32_b16"
+                        | "s_pack_hh_b32_b16"
                 ) =>
                 {
                     return Ok(());
@@ -7346,7 +7478,7 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        let h = self.size_view_handle(site, first, &src, props, image.is_none())?; // amd.rs (DexNom PR 62)
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -11946,11 +12078,15 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
-                // The clamped then the unclamped level of detail.
+                // The clamped then the unclamped level of detail. Out-of-bound coords
+                // for array/2D/1D dimensions must be `undef` for DXIL validation.
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                let fu = self.s.m.undef(f32t);
+                let c1 = if kind == 6 { fu } else { cs[1] };
+                let c2 = if kind == 6 || kind == 7 { fu } else { cs[2] };
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -11959,7 +12095,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, cs[0], c1, c2, clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -13188,16 +13324,21 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let is_ps = !mesh && matches!(self.x.native.stage, HwStage::Ps);
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            let colour = is_ps && el.kind == 16;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if half.is_some() => {
+                    let f = self.as_float(x);
+                    (".f32", if colour { self.clamp_hdr(f) } else { f })
+                }
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
                         None => self.as_float(x),
                     };
-                    (".f32", f)
+                    (".f32", if colour { self.clamp_hdr(f) } else { f })
                 }
                 _ => (".i32", x),
             };

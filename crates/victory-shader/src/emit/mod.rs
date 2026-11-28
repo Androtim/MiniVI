@@ -658,7 +658,10 @@ pub fn emit(
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
+        let single_wave_group =
+            matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64);
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let forward_wide = wide_option.is_none() && !wide_on && single_wave_group;
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -688,7 +691,14 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || driver_loop || forward_wide {
+                    let mode = if wide_on {
+                        WidenMode::Any
+                    } else if driver_loop {
+                        WidenMode::ActiveLoopOnly
+                    } else {
+                        WidenMode::ForwardOnly
+                    };
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -696,7 +706,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop, wide_on);
+                        let again = widen(c, native, base, why, mode, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -758,7 +768,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), WidenMode::Any, false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -767,7 +777,7 @@ pub fn emit(
         other => other,
     };
     let supported = |(shader, wave): (HostShader, Option<u32>)| {
-        if wave == Some(64) && lower::host_max_wave() == 32 {
+        if too_wide(wave) {
             Err(ShaderError::Unsupported {
                 offset: 0,
                 what: "no wave32 lowering for this wave64 program",
@@ -797,6 +807,32 @@ pub fn emit(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WidenMode {
+    /// Any branch around a lowered construct (explicit allowlist or `VICTORY_WAVE_WIDE=1`).
+    Any,
+    /// Only forward (acyclic) branches — never widens loop back-edges.
+    ForwardOnly,
+    /// Only a single active-lane loop latch (`s_andn2_wrexec_b64` + `s_cbranch_scc1`).
+    ActiveLoopOnly,
+}
+
+fn rpo_index(p: &ir::Program) -> Vec<usize> {
+    let order = ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![0usize; p.blocks.len()];
+    for (i, &b) in order.iter().enumerate() {
+        rpo[b] = i;
+    }
+    rpo
+}
+
+fn is_back_edge_branch(p: &ir::Program, rpo: &[usize], b: usize) -> bool {
+    matches!(
+        p.blocks[b].exit,
+        ir::Exit::Branch { taken, not_taken } if rpo[taken] <= rpo[b] || rpo[not_taken] <= rpo[b]
+    )
+}
+
 /// it translates or a branch cannot be widened. Where a thread group is several console
 /// waves, those decide differently and a group barrier inside such a branch would wait for
 /// threads that never come: the host waves of each console wave meet on their own there
@@ -806,7 +842,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
-    active_loop_only: bool,
+    mode: WidenMode,
     groups: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
@@ -830,6 +866,7 @@ fn widen(
     let pairs = native.wave64
         && lower::host_max_wave() == 32
         && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
+    let rpo = rpo_index(p);
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
@@ -849,17 +886,12 @@ fn widen(
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
             if why {
-                let order = ir::reverse_postorder(&p.blocks);
-                let mut rpo = vec![0usize; p.blocks.len()];
-                for (i, &b) in order.iter().enumerate() {
-                    rpo[b] = i;
-                }
                 let mut sorted: Vec<usize> = wide.iter().copied().collect();
                 sorted.sort_unstable();
                 let desc: Vec<String> = sorted
                     .iter()
                     .map(|&b| {
-                        let back = matches!(p.blocks[b].exit, ir::Exit::Branch { taken, not_taken } if rpo[taken] <= rpo[b] || rpo[not_taken] <= rpo[b]);
+                        let back = is_back_edge_branch(p, &rpo, b);
                         let nm = p.blocks[b].insts.last().map_or("?", |i| i.name());
                         format!("B{b}({nm}{})", if back { ",BACK" } else { "" })
                     })
@@ -880,7 +912,16 @@ fn widen(
             }
             return r;
         }
-        if active_loop_only {
+        if mode == WidenMode::ForwardOnly && more.iter().any(|&b| is_back_edge_branch(p, &rpo, b)) {
+            if why {
+                eprintln!(
+                    "WAVE64-WIDE stopped with {} branches wave-wide: forward-only skips loop back-edge",
+                    wide.len()
+                );
+            }
+            return r;
+        }
+        if mode == WidenMode::ActiveLoopOnly {
             // Only a single backward branch on the SCC just set by
             // s_andn2_wrexec_b64. This instruction restricts EXEC to the
             // unfinished lanes. The guest repeats the loop if *either*
@@ -908,6 +949,12 @@ fn widen(
     }
 }
 
+/// Whether a translation asks for wider waves than the host's: 64 lanes on a host of
+/// 32-lane waves, which [`emit`] refuses.
+fn too_wide(wave: Option<u32>) -> bool {
+    wave == Some(64) && lower::host_max_wave() == 32
+}
+
 /// The translated program, and the wave size it requires of the host.
 /// Which programs get the branches that close or leave their loops taken by each host wave
 /// together where cross-lane code depends on the wave ([`emit_program`]):
@@ -928,7 +975,13 @@ fn loops_wave(native: &NativeProgram) -> bool {
 /// [`emit_program_plain`]; a program that comes out depending on the host's waves is
 /// translated once more with the per-lane branches that close or leave its loops taken by
 /// each host wave together ([`structure::structure_wide_host`]), and that translation is the
-/// one given if it needs no wider waves.
+/// one given if it needs no wider waves and the host has waves that wide ([`too_wide`]).
+/// One that still asks for 64 lanes on a host of 32 is no better than the first, and the
+/// first keeps the blocks its lowering named ([`lower::take_needs`]), around which
+/// [`widen`] takes the per-lane branches wave-wide: taken with the retry, `widen` saw none,
+/// stopped at waves of 64 and the program was refused (likely issue #539: from 64d4931 on,
+/// a compute program bound in dives no longer translates, "no wave32 lowering for this
+/// wave64 program", and the scene under water is not drawn).
 ///
 /// Why: the lowering turns the console's wave loops into loops each lane leaves on its own,
 /// and takes the code behind a loop as code the whole wave runs together. On NVIDIA the lanes
@@ -964,7 +1017,10 @@ fn emit_program(
     });
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
     match again {
-        Ok((shader, Some(w))) if w <= *wave => {
+        // Only take the host-wide-loop pass when it fits the host wave size;
+        // when it still requires wave64 on a 32-lane host, fall through so
+        // `lower::set_needs(needs)` restores the blocked blocks for `widen()`.
+        Ok((shader, Some(w))) if w <= *wave && !too_wide(Some(w)) => {
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }
@@ -1019,7 +1075,7 @@ fn emit_program_plain(
         };
     }
     // (DexNom/VIctory 5f4c3df4.)
-    if native.stage == HwStage::Vs
+    if matches!(native.stage, HwStage::Vs | HwStage::Ms)
         && let Some(psv) = c.part(FourCC::PSV0)
     {
         vertex_output_interpolation(psv.data, &mut outputs)?;
@@ -1129,8 +1185,8 @@ fn vertex_output_interpolation(
     let info_size = size(&mut data)?;
     let info = take(&mut data, info_size)?;
     // PSVRuntimeInfo0 has no signature. PSVRuntimeInfo1 and later share
-    // these stage and signature count fields.
-    if info.len() < 36 || info[24] != 1 || info[29] == 0 {
+    // these stage and signature count fields (1 vertex, 13 mesh).
+    if info.len() < 36 || !matches!(info[24], 1 | 13) || info[29] == 0 {
         return Ok(());
     }
     let resources = size(&mut data)?;
@@ -2912,6 +2968,33 @@ mod atomic_tests {
             }
         }
     }
+
+    /// A program's constant table starts after its instructions, unless a
+    /// load at a fixed offset reads below that.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        use super::lower::code_table_start;
+        use crate::{ir, resource};
+        // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, 0xBF81_0000];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        // A load at a computed offset from the code's start: the table is
+        // the constants only, not the whole program.
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        // A load at a fixed offset inside the instructions keeps the start.
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        // Loads past the instructions only: from the lowest of them.
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
 }
 
 #[cfg(test)]
@@ -3379,5 +3462,44 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn back_edge_branch_distinguishes_forward_diamonds_from_loops() {
+        let block = |preds: Vec<usize>, exit: ir::Exit| ir::Block {
+            offset: 0,
+            preds,
+            phis: Vec::new(),
+            insts: Vec::new(),
+            exit,
+        };
+        // Diamond: 0 -> (1, 2) -> 3 (end): no back-edges.
+        let diamond = ir::Program {
+            wave64: true,
+            vgprs: 0,
+            inputs: Vec::new(),
+            blocks: vec![
+                block(vec![], ir::Exit::Branch { taken: 1, not_taken: 2 }),
+                block(vec![0], ir::Exit::Jump(3)),
+                block(vec![0], ir::Exit::Jump(3)),
+                block(vec![1, 2], ir::Exit::End),
+            ],
+        };
+        let rpo_d = super::rpo_index(&diamond);
+        assert!(!super::is_back_edge_branch(&diamond, &rpo_d, 0));
+
+        // Loop: 0 -> 1 -> (1, 2): block 1 branches back to itself.
+        let looped = ir::Program {
+            wave64: true,
+            vgprs: 0,
+            inputs: Vec::new(),
+            blocks: vec![
+                block(vec![], ir::Exit::Jump(1)),
+                block(vec![0, 1], ir::Exit::Branch { taken: 1, not_taken: 2 }),
+                block(vec![1], ir::Exit::End),
+            ],
+        };
+        let rpo_l = super::rpo_index(&looped);
+        assert!(super::is_back_edge_branch(&looped, &rpo_l, 1));
     }
 }

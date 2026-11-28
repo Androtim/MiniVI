@@ -627,13 +627,46 @@ pub fn adapter_name() -> Option<String> {
     default_adapter().map(|a| a.0)
 }
 
-/// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
-/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU").
-pub fn dlss_framegen_card(name: &str) -> bool {
+/// An NVIDIA RTX card's generation, read from its name, as the GeForce
+/// series of the same architecture (20 Turing, 30 Ampere, 40 Ada, 50
+/// Blackwell), and whether it is a workstation card. `None`: no RTX name.
+///
+/// The workstation cards are named apart from the GeForce ones, and their
+/// numbers say nothing of the generation: "Quadro RTX 5000" is Turing,
+/// "NVIDIA RTX A4500" Ampere, "NVIDIA RTX 2000 Ada Generation" Ada and
+/// "NVIDIA RTX PRO 4000 Blackwell SFF Edition" Blackwell (#312).
+pub fn rtx_generation(name: &str) -> Option<(u32, bool)> {
     let name = name.to_ascii_uppercase();
-    let Some(at) = name.find("RTX") else { return false };
-    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
-    model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
+    let words: Vec<&str> = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let at = words.iter().position(|w| *w == "RTX")?;
+    let has = |w: &str| words.contains(&w);
+    if has("BLACKWELL") || words.get(at + 1) == Some(&"PRO") {
+        return Some((50, true));
+    }
+    if has("ADA") {
+        return Some((40, true));
+    }
+    let next = words.get(at + 1)?;
+    if let Some(digits) = next.strip_prefix('A')
+        && digits.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return Some((30, true));
+    }
+    let model: String = next.chars().take_while(char::is_ascii_digit).collect();
+    if model.len() != 4 {
+        return None;
+    }
+    if has("QUADRO") {
+        return Some((20, true));
+    }
+    Some((model[..2].parse().ok()?, false))
+}
+
+/// Whether a card of this name runs DLSS Frame Generation: an RTX of the
+/// Ada generation or later ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090
+/// Laptop GPU", "NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX PRO 6000 Blackwell").
+pub fn dlss_framegen_card(name: &str) -> bool {
+    rtx_generation(name).is_some_and(|(series, _)| series >= 40)
 }
 
 /// The card the host device is made on (`hardware_adapter`; else the first
@@ -1316,8 +1349,44 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
         let mut settings = abi::DlssOptimalSettings::default();
         // SAFETY: filled options and a structure to fill.
         let code = unsafe { optimal_of(&options, &mut settings) };
-        let size = (code == 0 && settings.optimal_render_width > 0)
+        tracing::info!(
+            mode = plan::sl_mode_name(mode),
+            ?output,
+            code,
+            result = abi::result_name(code),
+            width = settings.optimal_render_width,
+            height = settings.optimal_render_height,
+            min = ?[settings.render_width_min, settings.render_height_min],
+            max = ?[settings.render_width_max, settings.render_height_max],
+            "DLSS: slDLSSGetOptimalSettings"
+        );
+        let mut size = (code == 0 && settings.optimal_render_width > 0)
             .then_some([settings.optimal_render_width, settings.optimal_render_height]);
+        // A driver-side DLSS override (NVIDIA App) answers every mode with its own optimal
+        // size (960x540 for 1080p on an RTX 3060 here), so a 1280x720 scene fit none and every
+        // upscaling was dropped (a black picture). DLSS takes any render between the mode's
+        // minimum and maximum: where the optimal size is smaller than the scene but the range
+        // holds it, the mode is offered at its maximum. `VICTORY_DLSS_RANGE=0`: as before.
+        let render = camera.render;
+        if let Some(opt) = size
+            && (opt[0] < render[0] || opt[1] < render[1])
+            && std::env::var_os("VICTORY_DLSS_RANGE").is_none_or(|v| v != "0")
+        {
+            let (min, max) = (
+                [settings.render_width_min, settings.render_height_min],
+                [settings.render_width_max, settings.render_height_max],
+            );
+            if min[0] <= render[0] && min[1] <= render[1] && max[0] >= render[0] && max[1] >= render[1] {
+                once!(
+                    info,
+                    ?render,
+                    optimal = ?opt,
+                    ?max,
+                    "DLSS: the scene is larger than the optimal size (a driver override?); offered at the mode's maximum"
+                );
+                size = Some(max);
+            }
+        }
         calls.optimal.push((output, mode, size));
         size
     };
@@ -1635,11 +1704,25 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     // Where the interface is no plane of its own (Series X): the copy of
     // this texture taken in front of the title's interface composite.
     let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
-    let (sl, functions) = (SL.get()?, FUNCTIONS.get()?);
-    let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
+    let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else {
+        once!(warn, "DLSS Frame Generation: present_begins: Streamline or its functions not set");
+        return None;
+    };
+    let (Some(set_options), Some(marker)) = (functions.dlssg_set_options, functions.pcl_set_marker) else {
+        once!(
+            warn,
+            "DLSS Frame Generation: present_begins: slDLSSGSetOptions {} / slPCLSetMarker {}",
+            functions.dlssg_set_options.is_some(),
+            functions.pcl_set_marker.is_some()
+        );
+        return None;
+    };
     let began = std::time::Instant::now();
     let frame = frame as u32;
-    let token = frame_token(sl, frame)?;
+    let Some(token) = frame_token(sl, frame) else {
+        once!(warn, frame, "DLSS Frame Generation: present_begins: no frame token");
+        return None;
+    };
     let mark = |m: u32| {
         let began = std::time::Instant::now();
         // SAFETY: a marker for a token of ours.
@@ -1934,6 +2017,22 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         // SAFETY: a structure to fill, no options (no estimate asked).
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
+        {
+            static ASKED: AtomicU32 = AtomicU32::new(0);
+            let n = ASKED.fetch_add(1, Relaxed);
+            if n < 4 || n.is_multiple_of(120) {
+                tracing::info!(
+                    n,
+                    code,
+                    status = format_args!("{:#x}", state.status),
+                    presented = state.num_frames_actually_presented,
+                    generate_max = state.num_frames_to_generate_max,
+                    min_size = state.min_width_or_height,
+                    vram_mb = state.estimated_vram_usage_in_bytes >> 20,
+                    "DLSS Frame Generation: slDLSSGGetState after the present"
+                );
+            }
+        }
         if code == 0 {
             FG_PER.store(state.num_frames_actually_presented.max(1), Relaxed);
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
