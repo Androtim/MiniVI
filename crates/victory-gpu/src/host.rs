@@ -2962,6 +2962,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// An upload of a texture detiled on the card (`crate::detile`): title memory
+    /// goes into the upload's slice and its detile into the submission's first list,
+    /// every time the list is submitted.
+    GpuTexture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::detile::Upload>),
     /// Reads a CPU-written linear movie plane into a per-list upload buffer.
     Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
@@ -3714,7 +3718,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging) | Step::GpuTexture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -6471,6 +6475,14 @@ impl Host {
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
+        if crate::detile::on()
+            && let Some(pre) = crate::detile::pre_list()
+        {
+            lists.insert(0, Some(pre));
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
         crate::watch::ask_once_end();
         split.part(2);
         stage.next("submit: snapshots");
@@ -6557,6 +6569,9 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if crate::detile::on() {
+                crate::detile::sent(*submitted);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
@@ -6655,6 +6670,9 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        if crate::detile::on() {
+            crate::detile::sent(*submitted);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -8335,6 +8353,16 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// [`HostList::defer_texture`] for an upload detiled on the card: its slices
+    /// are filled when the list is submitted, and held until it is reset.
+    pub(crate) fn defer_gpu_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        upload: std::sync::Arc<crate::detile::Upload>,
+    ) {
+        self.deferred().copies.push(Step::GpuTexture(staging, upload));
+    }
+
     /// [`HostList::defer_texture`] of a texture whose upload the list's
     /// prelude records if the check finds it due
     /// (`crate::texture::prelude_uploads`; [`HostList::prelude_uploads`]).
@@ -8508,6 +8536,13 @@ impl HostList {
                             batch.refresh_textures();
                         }
                     }
+                    continue;
+                }
+                Step::GpuTexture(staging, upload) => {
+                    // Filled whatever the check says: the list's copy reads this slice.
+                    // Later checks of the texture in this submission find it current.
+                    batch.texture_due(staging);
+                    staging.gpu_fill(upload);
                     continue;
                 }
                 Step::Plane((_, len), fill) => {
@@ -10895,6 +10930,13 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The last value the card reached on the host queue's fence: every
+    /// submission signalled at or below it has run.
+    pub(crate) fn completed(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

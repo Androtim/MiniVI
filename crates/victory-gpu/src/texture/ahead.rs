@@ -90,7 +90,11 @@ static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Takes the first upload of `resource`'s levels from `first` on, `there` of
 /// whose bytes are mapped (`u64::MAX`: not known). `None`: the list's.
 pub(crate) fn take(resource: This, first: u32, there: u64) -> Option<Taken> {
-    if on() { claim(resource, first, there) } else { None }
+    if on() && !(crate::detile::on() && crate::detile::ready()) {
+        claim(resource, first, there)
+    } else {
+        None
+    }
 }
 
 fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
@@ -287,6 +291,9 @@ impl Job {
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
         let (s, texture) = (&self.staging, &self.copy.texture);
+        let Some(cpu) = s.cpu.get() else {
+            return;
+        };
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -296,10 +303,10 @@ impl Job {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&s.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(&cpu.buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: s.base + footprint.Offset, ..*footprint },
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: cpu.base + footprint.Offset, ..*footprint },
                 },
             };
             // SAFETY: the caller's.
