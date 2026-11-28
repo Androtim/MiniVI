@@ -756,7 +756,7 @@ pub(crate) struct Digest(u128);
 /// Whether `list` has recorded [`upload_from`]'s upload of `resource`
 /// from level `first` (or been asked to: see [`UPLOAD_STAGED`]).
 pub(crate) fn upload_listed(list: &HostList, resource: This, first: u32) -> bool {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = if crate::resource::held_only() || crate::tiles::wanted() { first } else { 0 };
     list.used(upload_key(resource, first))
 }
 
@@ -773,7 +773,7 @@ thread_local! {
 }
 
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = if crate::resource::held_only() || crate::tiles::wanted() { first } else { 0 };
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1032,9 +1032,19 @@ impl PreludeUpload {
     /// `list` (the prelude), the host texture in the copy destination state.
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
         let texture = &self.copy.texture;
+        let held = self
+            .staging
+            .on_demand
+            .then(|| self.staging.detiled.load(std::sync::atomic::Ordering::Relaxed));
         // The staging buffer lives as long as `self.staging`, which the
         // list's steps hold until it is reset.
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
+            if let Some(held) = held {
+                let mip = self.staging.part(i).0;
+                if mip < 32 && held & (1 << mip) == 0 {
+                    continue;
+                }
+            }
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -1323,6 +1333,71 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+fn judgement_at(memory: *const u8, size: u64) -> [u64; 2] {
+    let start = memory as u64;
+    let first = crate::descriptor::host::first_viewed(start).map_or(0, u64::from);
+    let limit = crate::descriptor::host::next_start(start, start.saturating_add(size))
+        .map_or(u64::MAX, |at| at - start);
+    [first, limit]
+}
+
+fn held_levels_of(
+    layout: &victory_formats::texture::Layout,
+    memory: *const u8,
+    [first, limit]: [u64; 2],
+) -> u32 {
+    let mips = &layout.mips;
+    if layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
+        return u32::MAX;
+    }
+    let tail = (layout.first_tail_mip as usize).min(mips.len());
+    let there = |from: u64, to: u64| {
+        to > from && to <= limit && committed(memory.wrapping_add(from as usize), (to - from) as usize)
+    };
+    let mut held = 0u32;
+    for (level, m) in mips.iter().enumerate().take(tail) {
+        let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
+        if level as u64 >= first && there(m.offset, end) {
+            held |= 1 << level;
+        }
+    }
+    if tail < mips.len() && there(0, layout.alignment.min(layout.slice_size)) {
+        for level in tail..mips.len() {
+            if level as u64 >= first {
+                held |= 1 << level;
+            }
+        }
+    }
+    held
+}
+
+/// First mip level that an `on_demand` staging buffer needs to cover,
+/// skipping unheld and capped coarse levels. Returns the smallest mip
+/// when no pages are committed (`held == 0`).
+fn on_demand_first(
+    layout: &victory_formats::texture::Layout,
+    memory: *const u8,
+    requested: u32,
+    judged: [u64; 2],
+    max_dim: Option<u32>,
+) -> u32 {
+    let last = layout.mips.len().saturating_sub(1) as u32;
+    let held = crate::tiles::cap_levels(
+        held_levels_of(layout, memory, judged),
+        u64::from(layout.desc.width),
+        layout.desc.height,
+        layout.mips.len(),
+        layout.first_tail_mip as usize,
+        max_dim,
+    );
+    let lowest = if held == 0 {
+        last
+    } else {
+        held.trailing_zeros().min(last)
+    };
+    requested.max(lowest).min(last)
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1333,11 +1408,7 @@ impl Staging {
     /// viewed from level 0 although a neighbour sits where its large
     /// levels would be.
     fn judgement(&self) -> [u64; 2] {
-        let start = self.memory as u64;
-        let first = crate::descriptor::host::first_viewed(start).map_or(0, u64::from);
-        let limit = crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
-            .map_or(u64::MAX, |at| at - start);
-        [first, limit]
+        judgement_at(self.memory, self.layout.size)
     }
 
     /// What [`Staging::judgement`] said at the last detiling.
@@ -1354,30 +1425,8 @@ impl Staging {
     /// levels from the smallest up, level 0 last:
     /// `victory_formats::texture::Layout`.) A texture this cannot tell
     /// the levels of holds them all.
-    fn held_levels(&self, [first, limit]: [u64; 2]) -> u32 {
-        let mips = &self.layout.mips;
-        if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
-            return u32::MAX;
-        }
-        let tail = (self.layout.first_tail_mip as usize).min(mips.len());
-        let there = |from: u64, to: u64| {
-            to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
-        };
-        let mut held = 0u32;
-        for (level, m) in mips.iter().enumerate().take(tail) {
-            let end = if level == 0 { self.layout.slice_size } else { mips[level - 1].offset };
-            if level as u64 >= first && there(m.offset, end) {
-                held |= 1 << level;
-            }
-        }
-        if tail < mips.len() && there(0, self.layout.alignment.min(self.layout.slice_size)) {
-            for level in tail..mips.len() {
-                if level as u64 >= first {
-                    held |= 1 << level;
-                }
-            }
-        }
-        held
+    fn held_levels(&self, judged: [u64; 2]) -> u32 {
+        held_levels_of(&self.layout, self.memory, judged)
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -1720,7 +1769,7 @@ impl Staging {
             let judged = self.judgement();
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
-            let held = crate::tiles::cap_levels(
+            let mut held = crate::tiles::cap_levels(
                 self.held_levels(judged),
                 u64::from(self.layout.desc.width),
                 self.layout.desc.height,
@@ -1728,6 +1777,7 @@ impl Staging {
                 self.layout.first_tail_mip as usize,
                 crate::tiles::max_dim(),
             );
+            held &= if self.first < 32 { !0u32 << self.first } else { 0 };
             self.detiled.store(held, Relaxed);
             held
         } else {
@@ -2123,19 +2173,13 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 }
 
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
-    let texture = &copy.texture;
-    // Asked before the table is locked: the sweep lets go of a staging
-    // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first.max(copy.base)
-        && s.serial == copy.serial
-    {
-        return Some(s.clone());
-    }
+fn staging_layout(
+    resource: This,
+) -> Option<(
+    *const u8,
+    crate::resource::ResourceDesc,
+    victory_formats::texture::Layout,
+)> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -2149,6 +2193,34 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
+    Some((memory, desc, layout))
+}
+
+fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+    let texture = &copy.texture;
+    // Asked before the table is locked: the sweep lets go of a staging
+    // buffer with its texture's host side locked, in that order.
+    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let (pre_loaded, first) = if on_demand {
+        let (memory, desc, layout) = staging_layout(resource)?;
+        let judged = judgement_at(memory, layout.size);
+        let first = on_demand_first(&layout, memory, first, judged, crate::tiles::max_dim());
+        (Some((memory, desc, layout)), first)
+    } else {
+        (None, first)
+    };
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if let Some(s) = map.get(&(resource as usize))
+        && s.first <= first.max(copy.base)
+        && s.serial == copy.serial
+    {
+        return Some(s.clone());
+    }
+    let (memory, desc, layout) = match pre_loaded {
+        Some(loaded) => loaded,
+        None => staging_layout(resource)?,
+    };
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -2710,5 +2782,115 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+}
+
+#[cfg(test)]
+mod on_demand_staging_tests {
+    use super::on_demand_first;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    struct Reserved {
+        ptr: *mut u8,
+    }
+
+    impl Reserved {
+        fn new(size: usize) -> Self {
+            // SAFETY: reserving an anonymous region for test commit boundaries.
+            let ptr = unsafe {
+                VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE).cast::<u8>()
+            };
+            assert!(!ptr.is_null(), "VirtualAlloc(MEM_RESERVE) failed");
+            Self { ptr }
+        }
+
+        fn commit(&self, offset: u64, len: u64) {
+            // SAFETY: offset..offset+len lies inside the reserved region.
+            let p = unsafe {
+                VirtualAlloc(
+                    self.ptr.add(offset as usize).cast(),
+                    len as usize,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!p.is_null(), "VirtualAlloc(MEM_COMMIT) failed at {offset}+{len}");
+        }
+    }
+
+    impl Drop for Reserved {
+        fn drop(&mut self) {
+            // SAFETY: owned MEM_RESERVE region.
+            unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn on_demand_first_tracks_committed_levels_and_max_dim() {
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 2048,
+            height: 2048,
+            depth: 1,
+            mips: 12,
+            element_bytes: 16,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        };
+        let layout = Layout::new(&desc).expect("2048x2048 BC7 layout");
+        let last = (layout.mips.len() - 1) as u32;
+        let region = Reserved::new(layout.size as usize);
+
+        // Uncommitted region (`held == 0`): allocate only the smallest mip.
+        assert_eq!(
+            on_demand_first(&layout, region.ptr, 0, [0, u64::MAX], None),
+            last
+        );
+
+        // Committing the tail block raises the staging coverage to the tail.
+        let tail_bytes = layout.alignment.min(layout.slice_size);
+        region.commit(0, tail_bytes);
+        assert_eq!(
+            on_demand_first(&layout, region.ptr, 0, [0, u64::MAX], None),
+            layout.first_tail_mip
+        );
+        assert_eq!(
+            on_demand_first(
+                &layout,
+                region.ptr,
+                layout.first_tail_mip + 1,
+                [0, u64::MAX],
+                None
+            ),
+            layout.first_tail_mip + 1
+        );
+
+        // Committing upper mip 2 (512x512) lowers `first` to 2 without committing mips 0..2.
+        let m2_start = layout.mips[2].offset;
+        let m2_end = layout.mips[1].offset;
+        region.commit(m2_start, m2_end - m2_start);
+        assert_eq!(
+            on_demand_first(&layout, region.ptr, 0, [0, u64::MAX], None),
+            2
+        );
+
+        // Even with mips 0..2 fully committed, `max_dim = Some(512)` caps staging to mip 2.
+        region.commit(0, layout.size);
+        assert_eq!(
+            on_demand_first(&layout, region.ptr, 0, [0, u64::MAX], None),
+            0
+        );
+        assert_eq!(
+            on_demand_first(&layout, region.ptr, 0, [0, u64::MAX], Some(512)),
+            2
+        );
+        assert_eq!(
+            on_demand_first(&layout, region.ptr, 3, [0, u64::MAX], Some(512)),
+            3
+        );
     }
 }
