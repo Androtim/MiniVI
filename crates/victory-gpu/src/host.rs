@@ -3042,13 +3042,64 @@ impl Deferred {
         self.gpu_written.clear();
         self.filled.clear();
     }
+
+    /// Clears all per-recording entries while keeping warm collection capacities
+    /// (clamping rare loading-screen spikes so resident memory stays bounded).
+    fn clear(&mut self) {
+        fn clamp_vec<T>(v: &mut Vec<T>, max_cap: usize, target: usize) {
+            v.clear();
+            if v.capacity() > max_cap {
+                v.shrink_to(target);
+            }
+        }
+        fn clamp_set<T, S>(s: &mut std::collections::HashSet<T, S>, max_cap: usize, target: usize)
+        where
+            T: Eq + std::hash::Hash,
+            S: std::hash::BuildHasher,
+        {
+            s.clear();
+            if s.capacity() > max_cap {
+                s.shrink_to(target);
+            }
+        }
+        if !self.plane_uploads.is_empty() {
+            give_chunks(std::mem::take(&mut self.plane_uploads));
+        }
+        if !self.uploads.is_empty() || self.upload_bytes != 0 {
+            ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+            ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+            self.upload_bytes = 0;
+            clamp_vec(&mut self.uploads, 256, 64);
+        }
+        clamp_vec(&mut self.copies, 4096, 1024);
+        clamp_vec(&mut self.prelude_uploads, 1024, 256);
+        clamp_vec(&mut self.kept, 4096, 1024);
+        clamp_set(&mut self.bound, 1024, 256);
+        clamp_set(&mut self.refreshed, 4096, 1024);
+        clamp_set(&mut self.gpu_written, 1024, 256);
+        self.filled.clear();
+        if self.filled.capacity() > 1024 {
+            self.filled.shrink_to(256);
+        }
+        clamp_set(&mut self.textures, 1024, 256);
+        clamp_vec(&mut self.writes, 256, 64);
+        clamp_vec(&mut self.backs, 256, 64);
+        clamp_vec(&mut self.back_wanted, 256, 64);
+        clamp_vec(&mut self.texture_backs, 256, 64);
+        self.budget_zeroed = false;
+        self.indirect_readable = 0;
+    }
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        give_chunks(std::mem::take(&mut self.plane_uploads));
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
-        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        if !self.plane_uploads.is_empty() {
+            give_chunks(std::mem::take(&mut self.plane_uploads));
+        }
+        if !self.uploads.is_empty() || self.upload_bytes != 0 {
+            ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+            ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        }
     }
 }
 
@@ -7244,7 +7295,7 @@ impl HostList {
         self.upscale.store(0, Ordering::Relaxed);
         self.hudless.store(0, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7257,7 +7308,7 @@ impl HostList {
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
             // scratch memory any more, and the next list to ask takes it.
-            if scratch_pool() {
+            if scratch_pool() && !scratch.chunks.is_empty() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
@@ -12293,6 +12344,36 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn deferred_clear_reuses_warm_capacity_and_clamps_spikes() {
+        let mut d = super::Deferred::default();
+        for i in 0..64usize {
+            d.bound.insert(i);
+            d.textures.insert(i);
+        }
+        for i in 0..128usize {
+            d.refreshed.insert((i, i * 64, 64));
+        }
+        for i in 0..32usize {
+            d.filled.insert((i * 16, 16), i as u64);
+        }
+        d.budget_zeroed = true;
+        d.indirect_readable = 0x1234;
+        d.clear();
+        assert!(d.bound.is_empty() && d.bound.capacity() >= 64);
+        assert!(d.textures.is_empty() && d.textures.capacity() >= 64);
+        assert!(d.refreshed.is_empty() && d.refreshed.capacity() >= 128);
+        assert!(d.filled.is_empty() && d.filled.capacity() >= 32);
+        assert!(!d.budget_zeroed);
+        assert_eq!(d.indirect_readable, 0);
+
+        for i in 0..5000usize {
+            d.refreshed.insert((i, i * 64, 64));
+        }
+        d.clear();
+        assert!(d.refreshed.is_empty() && d.refreshed.capacity() < 5000);
     }
 }
 
