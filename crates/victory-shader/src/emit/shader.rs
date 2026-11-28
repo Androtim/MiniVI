@@ -29,6 +29,13 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
 /// running the full bindless heap buffer sweep.
 pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that reads a buffer or ray-tracing acceleration structure descriptor from
+/// the view heap (`RootType::ResourceHeap`) solely for its 64-bit title base
+/// address: a raw buffer of [`SLOT_STRIDES_COUNT`] entries of two dwords
+/// (8 bytes each, little-endian `(lo, hi)`), entry `i` the title base address
+/// of the view at heap slot `i` (`0` for non-buffers / null).
+pub const SLOT_VIEW_ADDRESSES: u8 = 251;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format

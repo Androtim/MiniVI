@@ -2391,3 +2391,147 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
         }
     }
 }
+
+/// Ray-tracing shadow mask shaders (`shadowmask:CS_TraceShadowRays_*`) load a
+/// 4-dword acceleration structure descriptor from `RootType::ResourceHeap` at
+/// a dynamic byte offset (`s_load_dwordx4 s[0:3], s[6:7], s8`) and read only
+/// its 64-bit title base address (`s0`, `s1`) to walk memory via `SLOT_MEMORY`.
+/// Verify `SLOT_VIEW_ADDRESSES` lowering, DXIL validation, and live GPU
+/// execution on hardware and WARP without requesting `SLOT_STRIDES`.
+#[test]
+fn resource_heap_view_address_roundtrip() {
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80)); // s5 = 0 (table high half)
+    words.push(s_mov_b32(7, 0x80)); // s7 = 0 (heap high half)
+    words.push(s_mov_b32(8, 0x80 + 64)); // s8 = 64 bytes -> heap slot 2
+    // s_load_dwordx4 s[0:3], s[6:7], s8
+    words.extend_from_slice(&[
+        0x3D << 26 | 0x02 << 18 | (6u32 >> 1),
+        8u32 << 25,
+    ]);
+    // s[12:15] = table[0] (raw UAV out)
+    words.extend_from_slice(&s_load_dwordx4_off(12, 4, 0));
+    // Extract s0 (lo) and s1 (hi) like CS_TraceShadowRays_*: mask upper bits of s1.
+    // v_mov_b32 v2, s0; v_mov_b32 v3, s1
+    words.push(vop1(0x01, 2, 0));
+    words.push(vop1(0x01, 3, 1));
+    // v4 = v0 << 3 (thread * 8)
+    words.push(0x3408_0083);
+    // buffer_store_dwordx2 v[2:3], v4, s[12:15], 0 offen
+    words.extend_from_slice(&[
+        0x38 << 26 | 0x1D << 18 | 1 << 12,
+        0x80 << 24 | (12u32 >> 2) << 16 | (2u32 << 8) | 4u32,
+    ]);
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1, // s0..s7
+            threads: [4, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    assert!(
+        shader.root_srvs.contains(&super::SLOT_VIEW_ADDRESSES),
+        "ResourceHeap view_address shader should request SLOT_VIEW_ADDRESSES"
+    );
+    assert!(
+        !shader.root_srvs.contains(&super::SLOT_STRIDES),
+        "view_address-only shader must not trigger bindless SLOT_STRIDES sweep"
+    );
+
+    // Populate view-address table with 8-byte (lo, hi) entries; slot 2 holds 0x0000_0123_DEAD_BEEF.
+    let addresses = vec![
+        0u32, 0u32,
+        0u32, 0u32,
+        0xDEAD_BEEF, 0x0000_0123,
+        0u32, 0u32,
+    ];
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: addresses.clone() }),
+                    ],
+                    views: &[View::RawUav(8)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{backend}: dispatch failed: {e}"));
+        assert_eq!(out[0][0], 0xDEAD_BEEF, "{backend}: lo dword mismatch");
+        assert_eq!(out[0][1], 0x0000_0123, "{backend}: hi dword mismatch");
+    }
+}

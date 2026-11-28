@@ -2078,6 +2078,24 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the shader reads the 64-bit title base address
+                        // of a view-heap buffer or acceleration structure slot
+                        // (`ResourceHeap`) to walk memory by address.
+                        match self.heap_addresses(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses without a view heap set"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -2447,6 +2465,26 @@ impl State {
         // Tag bit 1 (distinct from `heap_buffers`'s `| 1` and aligned guest pointers).
         if list.first_use(gpu as usize | 2)
             && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
+    /// The GPU address of the bound view heap's 64-bit view-address table
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`) without triggering a full
+    /// bindless buffer/texture sweep.
+    fn heap_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.addresses_gpu()?;
+        if list.first_use(gpu as usize | 1)
+            && let Some(buffer) = host.addresses_buffer()
         {
             list.keep(buffer);
         }
