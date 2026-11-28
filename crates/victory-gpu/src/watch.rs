@@ -319,6 +319,11 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// Whether the submission's single asking currently stands.
+pub(crate) fn journal_kept() -> bool {
+    journal().kept
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -326,6 +331,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -337,11 +347,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;

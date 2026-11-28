@@ -9245,24 +9245,23 @@ impl Batch {
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::journal_kept();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        const CHUNK: usize = 32;
+        let span_chunks = spans.len().div_ceil(CHUNK);
+        crate::shadow::wide_each(due.len() + span_chunks, move |i| {
             // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
+            let Some(chunk) = i.checked_sub(due.len()) else {
                 due[i].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Self::update(shadow, *from, *to);
+            let start = chunk * CHUNK;
+            let end = (start + CHUNK).min(spans.len());
+            Self::refresh_span_chunk(&spans[start..end], many);
         });
         if ahead {
             crate::watch::ask_ahead_done();
@@ -9375,6 +9374,23 @@ impl Batch {
         FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
     }
 
+    fn refresh_span_chunk(
+        items: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+        skip_unchanged: bool,
+    ) {
+        let mut skipped = 0u64;
+        for (shadow, from, to) in items {
+            if skip_unchanged && shadow.nothing_new(*from, *to - *from) {
+                skipped += 1;
+                continue;
+            }
+            Self::update(shadow, *from, *to);
+        }
+        if skipped != 0 {
+            FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+        }
+    }
+
     fn flush_all(&mut self) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
@@ -9391,7 +9407,7 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !crate::watch::journal_kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9411,15 +9427,14 @@ impl Batch {
             let before = PREPARING[0].load(Ordering::Relaxed);
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
+                // A chunk to a free thread, not an atomic claim per copy.
+                const CHUNK: usize = 32;
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Self::update(shadow, *from, *to);
+                let skip_check = refreshes.len() > FEW;
+                crate::shadow::wide_each(refreshes.len().div_ceil(CHUNK), move |chunk| {
+                    let start = chunk * CHUNK;
+                    let end = (start + CHUNK).min(refreshes.len());
+                    Self::refresh_span_chunk(&refreshes[start..end], skip_check);
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
