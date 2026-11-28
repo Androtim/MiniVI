@@ -2453,11 +2453,12 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            let freed = host.card_bytes();
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            KINDS[3].fetch_add(freed, Relaxed);
             went += 1;
-            bytes += host.bytes;
+            bytes += freed;
             if first.is_none() {
                 first = Some(at);
             }
@@ -2663,7 +2664,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
         if let Some((host, _)) = made.as_ref()
             && std::sync::Arc::strong_count(host) == 1
         {
-            copies.push((at, stamp & 0xffff_ffff, host.bytes));
+            copies.push((at, stamp & 0xffff_ffff, host.card_bytes()));
             raws.insert(windows::core::Interface::as_raw(&host.texture) as usize, at);
         }
     }
@@ -2699,13 +2700,14 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
         };
         match gone {
             Some((host, _)) => {
+                let freed = host.card_bytes();
                 r.host.gone.store(true, Relaxed);
                 KINDS[2].fetch_add(1, Relaxed);
-                KINDS[3].fetch_add(host.bytes, Relaxed);
+                KINDS[3].fetch_add(freed, Relaxed);
                 SLOT_EVICT[0].fetch_add(1, Relaxed);
-                SLOT_EVICT[1].fetch_add(host.bytes, Relaxed);
+                SLOT_EVICT[1].fetch_add(freed, Relaxed);
                 n += 1;
-                bytes += host.bytes;
+                bytes += freed;
                 crate::host::retire(host);
             }
             None => {
@@ -2865,6 +2867,15 @@ impl HostTexture {
         self.flags
     }
 
+    /// Card bytes held by this host copy: its own allocation, or the tiles
+    /// currently mapped to it if made level by level (`crate::tiles`).
+    fn card_bytes(&self) -> u64 {
+        match &self.tiled {
+            Some(tiled) => tiled.given_bytes(),
+            None => self.bytes,
+        }
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
@@ -3001,6 +3012,22 @@ fn host_texture(
     host_texture_as(desc, state, clear, false)
 }
 
+/// Whether a host texture may be placed inside a 64 MiB texture pool block
+/// (`crate::pool::texture`). Reserved textures (`crate::tiles`) must never
+/// use the pool because `CreatePlacedResource` returns a non-reserved
+/// texture that `Tiled::make` rejects, causing double allocation and zero
+/// levels-on-demand textures.
+#[cfg(any(windows, test))]
+fn use_texture_pool(
+    reserved: bool,
+    filled: bool,
+    sample_count: u32,
+    has_clear: bool,
+    readable_layout: bool,
+) -> bool {
+    !reserved && filled && sample_count <= 1 && !has_clear && readable_layout
+}
+
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
 /// tiles level by level (`crate::tiles`).
 #[cfg(windows)]
@@ -3066,10 +3093,13 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
-        && d.sample_count <= 1
-        && clear_value.is_none()
-        && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+    if use_texture_pool(
+        reserved,
+        fills(desc),
+        d.sample_count,
+        clear_value.is_some(),
+        texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor()),
+    )
         // SAFETY: the description has the host layout, as below.
         && let Some(t) = unsafe {
             crate::pool::texture(
@@ -3952,6 +3982,47 @@ mod tests {
         assert_eq!(oldest_covering(copies.clone(), 10), vec![0x100]);
         assert_eq!(oldest_covering(copies.clone(), 0), Vec::<usize>::new());
         assert_eq!(oldest_covering(copies, 1000), vec![0x100, 0x200, 0x300, 0x400]);
+    }
+
+    #[test]
+    fn reserved_textures_bypass_texture_pool() {
+        assert!(!use_texture_pool(true, true, 1, false, true));
+        assert!(!use_texture_pool(true, true, 4, true, false));
+        assert!(use_texture_pool(false, true, 1, false, true));
+        assert!(!use_texture_pool(false, false, 1, false, true));
+        assert!(!use_texture_pool(false, true, 4, false, true));
+        assert!(!use_texture_pool(false, true, 1, true, true));
+        assert!(!use_texture_pool(false, true, 1, false, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reserved_host_texture_is_tiled_even_with_texture_pool() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut options = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: plain feature query on live device.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        if asked.is_err() || options.TiledResourcesTier.0 < 2 {
+            return;
+        }
+        assert!(crate::pool::on(), "texture pool should be active by default");
+        // 1024x1024 BC7, 10 mips, single slice, 4 KiB blocks.
+        let desc = texture(1024, 1024, 98, 10);
+        let tex = host_texture_as(&desc, 0, std::ptr::null(), true)
+            .expect("reserved host texture should be created");
+        let tiled = crate::tiles::Tiled::make(&host.device, &tex, u32::from(desc.mip_levels));
+        assert!(
+            tiled.is_some(),
+            "reserved host texture must support Tiled::make even when pool is enabled"
+        );
     }
 
     /// A slot's table stamp is the frame plus one in 31 bits: "seen since
