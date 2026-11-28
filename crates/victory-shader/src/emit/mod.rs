@@ -750,12 +750,15 @@ pub fn emit(
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs), or a native-wave mask holding lanes outside EXEC read as data behind a
+    // per-lane branch: right once the wave takes that branch together ([`widen`]; the lowering
+    // has named the defining/skipped blocks).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK
+                    || (what == lower::MASK_ELSEWHERE
+                        && !(native.wave64 && lower::host_max_wave() == 32)))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
@@ -868,7 +871,14 @@ fn widen(
             }
             return r;
         }
-        let around = || lower::branches_around(&st, &needs);
+        let native_wave = !(native.wave64 && lower::host_max_wave() == 32);
+        let around = || {
+            if native_wave {
+                lower::branches_around_native(&st, &needs)
+            } else {
+                lower::branches_around(&st, &needs)
+            }
+        };
         let more: Vec<usize> = if pairs { lower::with_pair_meetings(around) } else { around() }
             .unwrap_or_default()
             .into_iter()
