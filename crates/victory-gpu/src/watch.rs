@@ -4340,7 +4340,7 @@ mod tests {
         assert_eq!(guard(one, one + SIZE), Some(pages(one)));
         assert_eq!(guard(two, two + SIZE), Some(pages(two)));
         let copy = crate::titlewrite::import("memcpy", real as *const () as usize);
-        crate::titlewrite::ON_IN_TEST.set(true);
+        crate::titlewrite::ON_IN_TEST.set(Some(true));
         let copy = if copy == real as *const () as usize {
             crate::titlewrite::copy_for_test(real as *const () as usize)
         } else {
@@ -4389,7 +4389,7 @@ mod tests {
             unsafe { ((one + 128 + k * 4) as *mut u32).write_volatile(7) };
         }
         assert!(writable(one));
-        crate::titlewrite::ON_IN_TEST.set(false);
+        crate::titlewrite::ON_IN_TEST.set(Some(false));
         drop_views(section, &[one, two], SIZE);
         crate::title_memory_section_gone(section);
     }

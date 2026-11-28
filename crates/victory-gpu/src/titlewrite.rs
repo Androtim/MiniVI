@@ -13,11 +13,11 @@
 //! reference count, the link of a free list.
 //!
 //! - [`import`]: the title's `memcpy`, `memmove` and `memset` are ours
-//!   (`VICTORY_COPY_BESIDE=1`; off unless asked for). They look at the bits
+//!   (`VICTORY_COPY_BESIDE=0` turns it off; on by default). They look at the bits
 //!   of the blocks they write and go to the runtime's own, but for the parts
 //!   that lie in guarded blocks.
 //! - [`store`]: a store that faults is done here, and the thread goes on
-//!   behind it (`VICTORY_STORE_BESIDE=1`; off unless asked for). Nothing of
+//!   behind it (`VICTORY_STORE_BESIDE=0` turns it off; on by default). Nothing of
 //!   the title's code is known ahead: the instruction is read where it
 //!   faulted, and one that is not understood opens the block as before. So
 //!   does a block's fifth store since it was taken, and one at a place in the
@@ -42,24 +42,27 @@ fn add(what: usize) {
 
 fn copies_on() -> bool {
     #[cfg(test)]
-    if ON_IN_TEST.get() {
-        return true;
+    if let Some(forced) = ON_IN_TEST.get() {
+        return forced;
     }
-    crate::asked_for!("VICTORY_COPY_BESIDE")
+    crate::toggled!("VICTORY_COPY_BESIDE")
 }
 
 fn stores_on() -> bool {
     #[cfg(test)]
-    if ON_IN_TEST.get() {
-        return true;
+    if let Some(forced) = ON_IN_TEST.get() {
+        return forced;
     }
-    crate::asked_for!("VICTORY_STORE_BESIDE")
+    crate::toggled!("VICTORY_STORE_BESIDE")
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Both, for this thread's writes.
-    pub(crate) static ON_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Both, for this thread's writes. Tests default to `Some(false)` so guard-opening
+    /// tests in `watch` keep exercising fault-open paths; set `Some(true)` to test
+    /// beside-the-guard paths or `None` to follow the default `toggled!` switch.
+    pub(crate) static ON_IN_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(Some(false)) };
 }
 
 /// The runtime's own `memcpy`, `memmove` and `memset`.
@@ -391,5 +394,26 @@ mod tests {
         assert!(overlap(10 * B + 5, 10 * B + 900, 8), "in one block");
         assert!(!overlap(10 * B + 5, 12 * B, 8) && !overlap(10 * B, 9 * B, B));
         assert!(overlap(10 * B, 9 * B, B + 1));
+    }
+
+    #[test]
+    fn beside_switches_default_on_and_respect_test_override() {
+        struct Restore(Option<bool>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ON_IN_TEST.set(self.0);
+            }
+        }
+        assert_eq!(ON_IN_TEST.get(), Some(false));
+        assert!(!copies_on() && !stores_on());
+        let _restore = Restore(ON_IN_TEST.replace(Some(true)));
+        assert!(copies_on() && stores_on());
+        ON_IN_TEST.set(None);
+        if std::env::var_os("VICTORY_COPY_BESIDE").is_none_or(|v| v != "0") {
+            assert!(copies_on());
+        }
+        if std::env::var_os("VICTORY_STORE_BESIDE").is_none_or(|v| v != "0") {
+            assert!(stores_on());
+        }
     }
 }
