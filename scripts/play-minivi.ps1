@@ -9,6 +9,8 @@ param(
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance', 'ultraperformance')][string]$Dlss = 'quality',
     [ValidateSet('off', 'auto', '2x', '3x', '4x', '5x', '6x')][string]$FrameGen = 'off',
     [ValidateSet('auto', 'dlss', 'fsr3')][string]$FrameGenType = 'auto',
+    [switch]$FrameGenReady,
+    [switch]$NoFrameGenReady,
     [ValidateRange(1, 1000)][int]$Fps = 1000,
     [switch]$LowVram,
     [switch]$HighVram,
@@ -133,7 +135,7 @@ $settings = @{
     VICTORY_CARD_REHASH_RUNS    = '1'
     VICTORY_JOIN_COPIES         = '1'
     VICTORY_CARD_STEPS          = '2'
-    VICTORY_CARD_AWAKE          = '1'
+    VICTORY_CARD_AWAKE          = '0'
     VICTORY_CARD_BUFFERS_MIN_KB = '64'
     VICTORY_INDIRECT_WINDOW     = '1'
     VICTORY_INDIRECT_BATCH      = '2'
@@ -146,8 +148,6 @@ $settings = @{
     VICTORY_TEXTURE_POOL        = '1'
     VICTORY_RIPE_BLOCKS         = '0'
     VICTORY_TEXTURE_NO_WAIT     = '1'
-    VICTORY_TEXTURE_CATCHUP     = '0'
-    VICTORY_TEXTURE_STAGE_MS    = '16'
     VICTORY_PRELUDE_UPLOADS     = '1'
     VICTORY_SHOW_NEW_LATER      = '1'
     VICTORY_POOL_SMALL          = '0'
@@ -162,7 +162,7 @@ $settings = @{
     VICTORY_AMBIENT_AIR         = '1.5'
     VICTORY_AMBIENT_SPECULAR    = '1'
     VICTORY_EARLY_DEPTH         = '1'
-    VICTORY_LEAVE_OUT           = '02384a60fda6f2d0,731a39171b568298'
+    VICTORY_LEAVE_OUT           = '731a39171b568298'
     VICTORY_PIPELINE_BOOK       = '1'
 
     # Watchdog & NaN scrubbing
@@ -180,6 +180,8 @@ if ($isLowVram) {
     $settings.VICTORY_LEVELS_ALL               = '1'
     $settings.VICTORY_LEVELS_MAX_DIM           = $maxDim
     $settings.VICTORY_LEVELS_RECLAIM           = '1'
+    $settings.VICTORY_TEXTURE_CATCHUP          = '0'
+    $settings.VICTORY_TEXTURE_STAGE_MS         = '16'
     $settings.VICTORY_CARD_BUFFERS_MB          = '1024'
     $settings.VICTORY_CARD_WINDOWS_MB          = '256'
     $settings.VICTORY_CARD_ROOM_FOR_TARGETS_MB = '512'
@@ -187,8 +189,10 @@ if ($isLowVram) {
     $settings.VICTORY_READBACK_POOL            = '1'
     $settings.VICTORY_READBACK_POOL_MB         = '64'
 } else {
-    # >9 GiB VRAM profile: full mip chains and engine VRAM-scaled buffers/headroom
+    # >9 GiB VRAM profile: full mip chains, catch-up enabled, and VRAM-scaled budgets
     $settings.VICTORY_LEVELS_ON_DEMAND         = '0'
+    $settings.VICTORY_TEXTURE_CATCHUP          = '1'
+    $settings.VICTORY_TEXTURE_STAGE_MS         = '24'
     $settings.VICTORY_DSTORAGE_STAGING_MB      = '128'
     $settings.VICTORY_READBACK_POOL            = '1'
     $settings.VICTORY_READBACK_POOL_MB         = '256'
@@ -249,13 +253,13 @@ if ($fgTimes -ge 2) {
         $settings.VICTORY_FSR_FRAMEGEN = '1'
     } else {
         $settings.VICTORY_FRAMEGEN = '1'
-        $settings.VICTORY_TEXTURE_ROOM_PERCENT = '80'
+        $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($fgTimes -gt 2) { '74' } else { '80' }
     }
     $settings.VICTORY_FRAMEGEN_X = [string]$fgTimes
     $settings.VICTORY_MENU_FRAMEGEN = [string]$fgTimes
 } else {
-    if (-not $Amd -and $Dlss -ne 'off' -and $settings.VICTORY_STREAMLINE_DIR -and (Test-Path (Join-Path $settings.VICTORY_STREAMLINE_DIR 'sl.interposer.dll'))) {
-        # Keep Streamline frame generation ready (off) so F1 menu can toggle it live.
+    if ($FrameGenReady -and -not $NoFrameGenReady -and -not $Amd -and $Dlss -ne 'off' -and $settings.VICTORY_STREAMLINE_DIR -and (Test-Path (Join-Path $settings.VICTORY_STREAMLINE_DIR 'sl.interposer.dll'))) {
+        # Keep Streamline frame generation ready (off) only when asked with -FrameGenReady.
         $settings.VICTORY_FRAMEGEN = '1'
         $settings.VICTORY_FRAMEGEN_X = '0'
         $settings.VICTORY_TEXTURE_ROOM_PERCENT = '86'
@@ -305,7 +309,7 @@ $settings.VICTORY_MENU_FG_TYPE = $menuFgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Preset $Preset -Build $Build"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Preset $Preset -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
 
 $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'target' }
 $victory = Join-Path $targetRoot "$Build\victory.exe"
@@ -327,7 +331,7 @@ if (-not $NoSmoothMotion -and $fgTimes -eq 0) {
     $victory = $sm
 }
 
-$keep = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
+$keep = 'VICTORY_HOME', 'VICTORY_ADAPTER', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $keep } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 

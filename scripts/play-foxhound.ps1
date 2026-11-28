@@ -29,7 +29,10 @@ param(
     # driver how many this card does and gives no more).
     [ValidateRange(2, 6)][int]$FrameGenX = 2,
     # Frame generation is made ready at every start with Streamline, on or off, so that the F1 menu switches it
-    # and changes its amount while playing. -NoFrameGenReady: only with -FrameGen, as before.
+    # and changes its amount while playing. Only with -FrameGenReady now: ready but off, Streamline's swap chain
+    # held this PC's frames at 14 a second (20 without), so frame generation off is off unless asked.
+    [switch]$FrameGenReady,
+    # (The default now; still taken.)
     [switch]$NoFrameGenReady,
     # Which frame generation: auto (DLSS Frame Generation where it runs, else AMD's FSR 3), dlss, or fsr (FSR 3
     # even on an RTX 40/50; 2X only). FSR 3 needs AMD's FidelityFX DLLs (VICTORY_FIDELITYFX_DIR, else
@@ -71,16 +74,16 @@ if ($menu['VICTORY_MENU_FPS'] -match '^\d+$' -and [int]$menu['VICTORY_MENU_FPS']
 $settings = @{
     # Submission and copy machinery
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_RELAY = '2'; VICTORY_RELAY_COPY = '1'; VICTORY_WIDE_BACK = '1'
-    VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_CARD_AWAKE = '1'
+    VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_CARD_STEPS = '2'; VICTORY_CARD_AWAKE = '0'
     VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_INDIRECT_BATCH = '2'
     VICTORY_UPLOAD_AHEAD = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_MAP_THREADS = '1'
     # Shader writes into big write-combined copies stay on the card (-5 ms a frame)
     VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'
     # The title's page-mapping copies kept without Windows views (no cutscene freezes at scene cuts)
     VICTORY_SOFT_VIEWS = 'copies'
-    # Textures: pool with no blocks made ahead, 16 ms a pass, no catch-up, levels not on demand (sharp)
-    VICTORY_TEXTURE_POOL = '1'; VICTORY_RIPE_BLOCKS = '0'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_TEXTURE_CATCHUP = '0'
-    VICTORY_TEXTURE_STAGE_MS = '16'; VICTORY_LEVELS_ON_DEMAND = '0'
+    # Textures: pool with no blocks made ahead, 24 ms a pass, catch-up on (>1024 due with room), levels not on demand (sharp)
+    VICTORY_TEXTURE_POOL = '1'; VICTORY_RIPE_BLOCKS = '0'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_TEXTURE_CATCHUP = '1'
+    VICTORY_TEXTURE_STAGE_MS = '24'; VICTORY_LEVELS_ON_DEMAND = '0'
     VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_POOL_SMALL = '0'; VICTORY_TABLED_REREAD = '1'
     VICTORY_QUEUE_HOST_TEXTURES = '0'
     # Descriptor heaps' records
@@ -90,8 +93,10 @@ $settings = @{
     VICTORY_AMBIENT = '0.8'; VICTORY_AMBIENT_AIR = '1.5'; VICTORY_AMBIENT_SPECULAR = '1'
     # Pixel programs keep the console's early depth test
     VICTORY_EARLY_DEPTH = '1'
-    # Left out: the decal heap's defragmentation (5.6 ms of GPU a frame) and the heat-haze pass (smeared blocks)
-    VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
+    # Left out: the heat-haze pass (smeared blocks). The decal heap's defragmentation
+    # (`CS_DefragHeap_ComputeRelocations`, 02384a60fda6f2d0) runs: without it the faces' meshes are
+    # missing (#100). The F1 menu leaves it out again if preferred.
+    VICTORY_LEAVE_OUT = '731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
 }
@@ -105,11 +110,13 @@ if ($Dlss -ne 'off') {
     if (Test-Path (Join-Path $sl 'sl.interposer.dll')) {
         $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss; $settings.VICTORY_STREAMLINE_DIR = $sl
         if ($FrameGen) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = [string]$timesWanted }
-        elseif (-not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
+        elseif ($FrameGenReady -and -not $NoFrameGenReady) { $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FRAMEGEN_X = '0' }   # ready, off
         # Frame generation takes 1.5 to 2 GB of the card's memory, which the layer otherwise fills with textures up
         # to nine tenths of its budget (on a 12 GB card it then ran out: no generated frames). On from the start, it
-        # is left a fifth of the budget; ready but off, a little less is held back.
-        if ($settings.VICTORY_FRAMEGEN -eq '1') { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
+        # is left a fifth of the budget (or more at 3x+); ready but off, a little less is held back.
+        if ($settings.VICTORY_FRAMEGEN -eq '1') {
+            $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen -and $timesWanted -gt 2) { '74' } elseif ($FrameGen) { '80' } else { '86' }
+        }
     } else {
         Write-Host "No NVIDIA files in ${sl}: running without DLSS and frame generation. Get-NVIDIA-DLSS.cmd in the"
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
@@ -117,7 +124,7 @@ if ($Dlss -ne 'off') {
 }
 # AMD FSR 3 frame generation: made ready as DLSS Frame Generation is (on, or ready and off for the F1 menu).
 # auto: the layer uses it only where DLSS Frame Generation does not run; fsr: DLSS Frame Generation is not asked.
-if ($FgType -ne 'dlss' -and ($FrameGen -or -not $NoFrameGenReady)) {
+if ($FgType -ne 'dlss' -and ($FrameGen -or ($FrameGenReady -and -not $NoFrameGenReady))) {
     $fx = if ($env:VICTORY_FIDELITYFX_DIR) { $env:VICTORY_FIDELITYFX_DIR } else { Join-Path $repo 'amd-sdk\FidelityFX\bin' }
     # Asked whatever is here: the layer checks the files and the card, and the start's notice (on the picture for
     # its first 30 s, and in this window) says what runs and why not. On Series X without DLSS it stays off: the
@@ -148,7 +155,7 @@ $settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($FrameGenReady -and -not $NoFrameGenReady) { ' -FrameGenReady' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {

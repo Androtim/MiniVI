@@ -62,7 +62,7 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_CARD_REHASH_RUNS", "1"),
     ("VICTORY_JOIN_COPIES", "1"),
     ("VICTORY_CARD_STEPS", "2"),
-    ("VICTORY_CARD_AWAKE", "1"),
+    ("VICTORY_CARD_AWAKE", "0"),
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
     ("VICTORY_INDIRECT_WINDOW", "1"),
     ("VICTORY_INDIRECT_BATCH", "2"),
@@ -84,8 +84,8 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_TEXTURE_POOL", "1"),
     ("VICTORY_RIPE_BLOCKS", "0"),
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
-    ("VICTORY_TEXTURE_CATCHUP", "0"),
-    ("VICTORY_TEXTURE_STAGE_MS", "16"),
+    ("VICTORY_TEXTURE_CATCHUP", "1"),
+    ("VICTORY_TEXTURE_STAGE_MS", "24"),
     ("VICTORY_LEVELS_ON_DEMAND", "0"),
     ("VICTORY_PRELUDE_UPLOADS", "1"),
     ("VICTORY_SHOW_NEW_LATER", "1"),
@@ -104,8 +104,9 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_AMBIENT_SPECULAR", "1"),
     // Pixel programs keep the console's early depth test
     ("VICTORY_EARLY_DEPTH", "1"),
-    // Left out: the decal heap's defragmentation and the heat-haze pass
-    ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
+    // Left out: the heat-haze pass. The decal heap's defragmentation runs: without
+    // it the faces' meshes are missing (#100).
+    ("VICTORY_LEAVE_OUT", "731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),
 ];
@@ -113,7 +114,16 @@ const SETTINGS: &[(&str, &str)] = &[
 /// Path settings a start keeps from its surroundings; every other
 /// `VICTORY_...` variable is cleared before the settings are put in (a
 /// restart from the menu inherits the last run's).
+///
+/// `VICTORY_HOME` and `VICTORY_ADAPTER` are read again after the clearing:
+/// the cache and save folders (`Config::load` in `run`), the restart the F1
+/// menu or the warm-up starts (which inherits this environment), and the
+/// card the host device is made on. Cleared, the caches and saves went to
+/// `%LOCALAPPDATA%` with `VICTORY_HOME` set (#472), and a named card was
+/// passed over for the one with the most memory.
 const KEPT: &[&str] = &[
+    "VICTORY_HOME",
+    "VICTORY_ADAPTER",
     "VICTORY_CONFIG",
     "VICTORY_GAME_DIR",
     "VICTORY_CACHE_DIR",
@@ -144,10 +154,16 @@ pub(crate) struct Play {
     #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
     dlss: String,
     /// DLSS frame generation on from the start: frames shown for each one
-    /// rendered, 2 to 6. Without it, it is ready and the F1 menu switches it.
+    /// rendered, 2 to 6. Without it, it is off (see `--framegen-ready`).
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=6))]
     framegen: Option<u32>,
-    /// Frame generation not made ready at the start.
+    /// Frame generation made ready but off at the start, so that the F1 menu
+    /// switches it while playing. Not by default: ready but off, frames go
+    /// through Streamline's swap chain, which held an RTX 5070 Ti's first
+    /// playable part at 14 a second (20 without).
+    #[arg(long)]
+    framegen_ready: bool,
+    /// (The default now; still taken.)
     #[arg(long)]
     no_framegen_ready: bool,
     /// Which frame generation: auto (DLSS frame generation where the card has
@@ -301,7 +317,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         set("VICTORY_STREAMLINE_DIR", &dir.to_string_lossy());
         if framegen {
             framegen_x = Some(times);
-        } else if !o.no_framegen_ready {
+        } else if o.framegen_ready && !o.no_framegen_ready {
             framegen_x = Some(0); // ready, off
         }
         if let Some(x) = framegen_x {
@@ -316,7 +332,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
     // it only where DLSS frame generation does not run; fsr, DLSS frame generation is not asked.
     // The layer checks the files and the card and says at the start what runs and why not.
-    if fg_type != "dlss" && (framegen || !o.no_framegen_ready) {
+    if fg_type != "dlss" && (framegen || o.framegen_ready && !o.no_framegen_ready) {
         set("VICTORY_FSR_FRAMEGEN", "1");
         if fg_type == "fsr" {
             s.remove("VICTORY_FRAMEGEN");
@@ -511,12 +527,10 @@ fn mfg_home() -> Result<PathBuf> {
 }
 
 /// A GeForce RTX of the 20 or 30 series ("NVIDIA GeForce RTX 3080", "... RTX 2060 SUPER"): DLSS
-/// runs, DLSS Frame Generation only with MFG Unlocker.
+/// runs, DLSS Frame Generation only with MFG Unlocker. Not the workstation cards: an "RTX 2000
+/// Ada Generation" runs DLSS Frame Generation itself (#312).
 fn older_rtx(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    let Some(at) = name.find("RTX") else { return false };
-    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
-    model.len() == 4 && (model.starts_with("20") || model.starts_with("30"))
+    victory_hle::streamline::rtx_generation(name).is_some_and(|(series, workstation)| !workstation && matches!(series, 20 | 30))
 }
 
 /// Runs the fetcher: MFG Unlocker from its author's GitHub release into `to`.
@@ -857,7 +871,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
     s.insert(
         "VICTORY_MENU_ARGS".to_owned(),
-        format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
+        format!("play {}{}", quoted(&exe), if o.framegen_ready && !o.no_framegen_ready { " --framegen-ready" } else { "" }),
     );
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
@@ -910,6 +924,7 @@ mod tests {
             res: "1440".to_owned(),
             dlss: "quality".to_owned(),
             framegen: None,
+            framegen_ready: false,
             no_framegen_ready: false,
             fg_type: "auto".to_owned(),
             fps: 1000,
@@ -930,7 +945,14 @@ mod tests {
         assert_eq!(get("VICTORY_NATIVE_1440P"), Some("1"));
         assert_eq!((get("VICTORY_DLSS"), get("VICTORY_DLSS_MODE")), (Some("1"), Some("quality")));
         assert_eq!(get("VICTORY_STREAMLINE_DIR"), Some(r"C:\nvidia"));
-        // frame generation ready, off, with a little memory held back for it
+        // frame generation off and not made ready: no swap chain of Streamline's, no memory held back
+        assert!(!s.contains_key("VICTORY_FRAMEGEN") && !s.contains_key("VICTORY_FRAMEGEN_X"));
+        assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN") && !s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
+        // ready, off, with a little memory held back for it, when asked
+        let mut o = options();
+        o.framegen_ready = true;
+        let (s, _) = settings(&o, &[], Some(dir));
+        let get = |k: &str| s.get(k).map(String::as_str);
         assert_eq!((get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
         assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("1000"));
@@ -944,10 +966,16 @@ mod tests {
         let get = |k: &str| s.get(k).map(String::as_str);
         assert!(!s.contains_key("VICTORY_DLSS") && !s.contains_key("VICTORY_FRAMEGEN"));
         assert_eq!(get("VICTORY_MENU_DLSS"), Some("off"));
-        // FSR 3 frame generation is made ready instead (the layer says whether it can run)
+        // nor FSR 3 frame generation, off and not made ready
+        assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN") && !s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
+        assert_eq!(get("VICTORY_MENU_FG_TYPE"), Some("auto"));
+        // made ready when asked: FSR 3 in place of DLSS's (the layer says whether it can run)
+        let mut o = options();
+        o.framegen_ready = true;
+        let (s, _) = settings(&o, &[], None);
+        let get = |k: &str| s.get(k).map(String::as_str);
         assert_eq!((get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
         assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
-        assert_eq!(get("VICTORY_MENU_FG_TYPE"), Some("auto"));
     }
 
     #[test]
@@ -1008,6 +1036,22 @@ mod tests {
         assert!(fg("NVIDIA GeForce RTX 5070") && fg("NVIDIA GeForce RTX 4070 SUPER") && fg("NVIDIA GeForce RTX 5090 Laptop GPU"));
         assert!(!fg("NVIDIA GeForce RTX 3080 Ti") && !fg("NVIDIA GeForce RTX 2060") && !fg("NVIDIA GeForce GTX 1080"));
         assert!(!fg("AMD Radeon RX 7900 XTX") && !fg("Intel(R) Arc(TM) A770 Graphics") && !fg(""));
+        // Workstation cards: the name says the generation, not the number (#312).
+        assert!(fg("NVIDIA RTX PRO 4000 Blackwell SFF Edition") && fg("NVIDIA RTX PRO 6000 Blackwell Workstation Edition"));
+        assert!(fg("NVIDIA RTX 2000 Ada Generation") && fg("NVIDIA RTX 6000 Ada Generation") && fg("NVIDIA RTX 3500 Ada Generation Laptop GPU"));
+        assert!(!fg("Quadro RTX 5000") && !fg("NVIDIA Quadro RTX 4000") && !fg("NVIDIA RTX A4500") && !fg("NVIDIA RTX A500 Laptop GPU"));
+    }
+
+    #[test]
+    fn rtx_generations_from_names() {
+        use victory_hle::streamline::rtx_generation as rg;
+        assert_eq!(rg("NVIDIA GeForce RTX 3070"), Some((30, false)));
+        assert_eq!(rg("NVIDIA GeForce RTX 5090 Laptop GPU"), Some((50, false)));
+        assert_eq!(rg("NVIDIA RTX PRO 4000 Blackwell SFF Edition"), Some((50, true)));
+        assert_eq!(rg("NVIDIA RTX 2000E Ada Generation"), Some((40, true)));
+        assert_eq!(rg("NVIDIA RTX A2000 12GB"), Some((30, true)));
+        assert_eq!(rg("Quadro RTX 8000"), Some((20, true)));
+        assert_eq!((rg("NVIDIA GeForce GTX 1080"), rg("AMD Radeon RX 7900 XTX"), rg("")), (None, None, None));
     }
 
     /// MFG Unlocker is offered only to RTX 20 and 30 cards.
@@ -1016,6 +1060,16 @@ mod tests {
         assert!(older_rtx("NVIDIA GeForce RTX 3080 Ti") && older_rtx("NVIDIA GeForce RTX 2060 SUPER") && older_rtx("NVIDIA GeForce RTX 3050 Laptop GPU"));
         assert!(!older_rtx("NVIDIA GeForce RTX 5070") && !older_rtx("NVIDIA GeForce RTX 4090") && !older_rtx("NVIDIA GeForce GTX 1080"));
         assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
+        assert!(!older_rtx("NVIDIA RTX 2000 Ada Generation") && !older_rtx("NVIDIA RTX 3500 Ada Generation Laptop GPU"));
+        assert!(!older_rtx("NVIDIA RTX PRO 2000 Blackwell") && !older_rtx("Quadro RTX 5000"));
+    }
+
+    /// Settings read again after `prepare` clears the others survive it.
+    #[test]
+    fn paths_and_the_named_card_are_kept() {
+        for k in ["VICTORY_HOME", "VICTORY_ADAPTER", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
+            assert!(KEPT.contains(&k), "{k}");
+        }
     }
 
     #[test]
