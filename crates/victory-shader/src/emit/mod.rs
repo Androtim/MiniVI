@@ -511,8 +511,59 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran ([`emit_once`]). A wave64 compute program
+/// that does not translate with the branches that close or leave its loops taken by each host
+/// wave together ([`loops_wave`]) is tried once more without them, as before that step: the
+/// underwater picture's program (`926c46bab3b86bd6`) translated before it and no longer did, so
+/// its dispatch was dropped and diving showed a field of white flares (ported from
+/// `trustno1-coder/VIctory-NVIDIA` `8fc2254`).
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res);
+    if !matches!(first, Err(ShaderError::Unsupported { .. })) || !loops_wave(native) {
+        return first;
+    }
+    let _guard = LoopsOffGuard::enter();
+    let again = emit_once(c, native, p, st, io, res);
+    match again {
+        Ok(shader) => {
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!("WAVE-LOOPS left out: the program translates without them");
+            }
+            Ok(shader)
+        }
+        Err(_) => first,
+    }
+}
+
+thread_local! {
+    /// [`emit`]'s second try: [`loops_wave`] off.
+    static LOOPS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct LoopsOffGuard(bool);
+
+impl LoopsOffGuard {
+    fn enter() -> Self {
+        let prev = LOOPS_OFF.with(|off| off.replace(true));
+        Self(prev)
+    }
+}
+
+impl Drop for LoopsOffGuard {
+    fn drop(&mut self) {
+        LOOPS_OFF.with(|off| off.set(self.0));
+    }
+}
+
+/// One try of [`emit`].
+fn emit_once(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -915,7 +966,7 @@ fn widen(
 /// - `2`: every compute program;
 /// - `0`: none, as before.
 fn loops_wave(native: &NativeProgram) -> bool {
-    if native.stage != HwStage::Cs {
+    if native.stage != HwStage::Cs || LOOPS_OFF.with(std::cell::Cell::get) {
         return false;
     }
     match std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) {
