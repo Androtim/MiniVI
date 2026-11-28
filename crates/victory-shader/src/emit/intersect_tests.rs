@@ -700,3 +700,39 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+#[test]
+fn memory_near_toggles_second_half_fast_path_and_keeps_results_identical() {
+    struct NearGuard(Option<bool>);
+    impl Drop for NearGuard {
+        fn drop(&mut self) {
+            super::TEST_MEMORY_NEAR.set(self.0);
+        }
+    }
+    let _guard = NearGuard(super::TEST_MEMORY_NEAR.get());
+
+    super::TEST_MEMORY_NEAR.set(Some(false));
+    let (far, _) = build(true, WHOLE).expect("memory_near=0 lowers");
+    super::TEST_MEMORY_NEAR.set(Some(true));
+    let (near, _) = build(true, WHOLE).expect("memory_near=1 lowers");
+
+    assert_ne!(near.dxil, far.dxil, "fast path emits distinct DXIL");
+    assert!(near.root_srvs.contains(&super::SLOT_MEMORY));
+    assert!(near.root_uavs.contains(&super::SLOT_FAULTS));
+    assert!(far.root_srvs.contains(&super::SLOT_MEMORY));
+    assert!(far.root_uavs.contains(&super::SLOT_FAULTS));
+
+    {
+        let _memory = Memory::at(BASE);
+        super::TEST_MEMORY_NEAR.set(Some(false));
+        run(true, WHOLE, BASE + u64::from(NODES), true);
+        super::TEST_MEMORY_NEAR.set(Some(true));
+        run(true, WHOLE, BASE + u64::from(NODES), true);
+    }
+
+    // Place node 0 so its 128-byte box spans a 64 KiB page boundary (`within = 0xFFC0 > 0xFF80`).
+    let base_cross = 0x12_3456_0000u64 + 0x1_0000 - u64::from(NODES) - 64;
+    let _memory = Memory::at(base_cross);
+    super::TEST_MEMORY_NEAR.set(Some(true));
+    run(true, WHOLE, base_cross + u64::from(NODES), true);
+}
