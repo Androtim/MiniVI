@@ -464,9 +464,19 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// a console wave takes together ([`Structured::wide`]) count as per-lane branches too, as
 /// two console waves of one group may take them different ways.
 fn all_lane_blocks_of(st: &Structured, group: bool) -> Option<Vec<bool>> {
+    all_lane_blocks_for(st, group, PAIR_MEETINGS.get())
+}
+
+/// [`all_lane_blocks`] for a native-wave program: includes each per-lane loop-latch block in
+/// its own region so a mask written on a later iteration is not treated as all-lanes.
+fn all_lane_blocks_native(st: &Structured) -> Option<Vec<bool>> {
+    all_lane_blocks_for(st, false, true)
+}
+
+fn all_lane_blocks_for(st: &Structured, group: bool, loops: bool) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
-    for (_, region) in lane_regions_of(st, group)? {
+    for (_, region) in lane_regions_for(st, group, loops)? {
         for b in (0..n).filter(|&b| region[b]) {
             all[b] = false;
         }
@@ -486,7 +496,10 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 /// loop (the code leads back to it) is in its own region: a lane that left the loop does not
 /// run it again. (Not yet for the other programs: their translations stay as they were.)
 fn lane_regions_of(st: &Structured, group: bool) -> Option<Vec<(usize, Vec<bool>)>> {
-    let loops = PAIR_MEETINGS.get();
+    lane_regions_for(st, group, PAIR_MEETINGS.get())
+}
+
+fn lane_regions_for(st: &Structured, group: bool, loops: bool) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -553,8 +566,18 @@ fn lane_regions_of(st: &Structured, group: bool) -> Option<Vec<(usize, Vec<bool>
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
 /// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
 pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+    branches_around_for(st, needs, PAIR_MEETINGS.get())
+}
+
+/// [`branches_around`] for a native-wave program: includes self-loop latch regions so a
+/// per-lane loop latch can be widened when a mask defined there is read as data.
+pub(super) fn branches_around_native(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+    branches_around_for(st, needs, true)
+}
+
+fn branches_around_for(st: &Structured, needs: &[usize], loops: bool) -> Option<Vec<usize>> {
     let mut out = Vec::new();
-    for (d, region) in lane_regions(st)? {
+    for (d, region) in lane_regions_for(st, false, loops)? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
@@ -3890,9 +3913,22 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        let native_console = self.exchange.is_none()
+            && self.halves.is_none()
+            && self.console_lanes
+            && self.mask_data == MaskData::Console;
+        let whole = if self.exchange.is_some() {
+            !self.local && made.is_none_or(|b| self.all_lanes(b))
+        } else if native_console {
+            made.is_none_or(|b| {
+                all_lane_blocks_native(self.x.st)
+                    .is_some_and(|all| all.get(b).copied().unwrap_or(false))
+            })
+        } else {
+            false
+        };
         if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
+            if (self.exchange.is_some() && !self.local) || native_console {
                 need(made.unwrap_or(0));
             }
             return Err(MASK_ELSEWHERE);
@@ -14299,5 +14335,248 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    struct HostWaveGuard(Option<u32>);
+
+    impl Drop for HostWaveGuard {
+        fn drop(&mut self) {
+            super::TEST_HOST_WAVE.set(self.0);
+        }
+    }
+
+    fn wave32_test_program(body: &[u32]) -> NativeProgram {
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+        ];
+        words.extend_from_slice(body);
+        words.push(S_ENDPGM);
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn dispatch_wave32(shader: &crate::emit::HostShader, constants: &[u32]) -> Option<u32> {
+        let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = crate::emit::host::Host::new(false) else {
+            return None;
+        };
+        let (root, pso) = host.compute_pipeline(shader).ok()?;
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Constants {
+                ud[u.index as usize] = constants.get(u.dword as usize).copied().unwrap_or(0);
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &crate::emit::host::Dispatch {
+                    roots: vec![(0, crate::emit::host::Root::Constants(ud))],
+                    views: &[crate::emit::host::View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][0])
+    }
+
+    #[test]
+    fn native_wave32_mask_elsewhere_in_all_lanes_block_translates_and_runs() {
+        let _guard = HostWaveGuard(super::TEST_HOST_WAVE.replace(Some(32)));
+        let native = wave32_test_program(&[
+            0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0  (v0 < s0)
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBE86_076A, // s_not_b32 s6, vcc_lo        (!EXEC lanes set -> !st.active)
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0x7E00_0206, // v_mov_b32 v0, s6
+            0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+        ]);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let s6 = p.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| i.write(crate::ir::Reg::S(6)))
+            .expect("s6 value");
+        let st = structure::structure(&p).expect("structure");
+        assert!(st.masks.contains_key(&s6), "s6 must be tracked as a lane mask");
+        assert!(
+            !st.active.contains(&s6),
+            "s6 holds !EXEC lanes so it must NOT be in st.active: {:?}",
+            st.active
+        );
+        let io = io::raise(&p, &native).expect("io::raise");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let c = crate::dxbc::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = crate::emit::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+        #[cfg(not(windows))]
+        let _ = &shader;
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            for (cutoff, expected) in [
+                (0u32, u32::MAX),
+                (1, u32::MAX ^ 1),
+                (13, u32::MAX ^ ((1 << 13) - 1)),
+                (32, 0),
+            ] {
+                let Some(got) = dispatch_wave32(&shader, &[cutoff]) else {
+                    return;
+                };
+                assert_eq!(got, expected, "cutoff {cutoff}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_wave32_mask_elsewhere_in_divergent_branch_widens_and_runs() {
+        let _guard = HostWaveGuard(super::TEST_HOST_WAVE.replace(Some(32)));
+        let native = wave32_test_program(&[
+            0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0  (v0 < s0)
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBF88_0004, // s_cbranch_execz +4 (to restore)
+            0xBE86_076A, // s_not_b32 s6, vcc_lo        (defined in branch, outside EXEC)
+            0x7E00_0206, // v_mov_b32 v0, s6
+            0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+        ]);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let branch = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+            .expect("branch");
+        let st = structure::structure(&p).expect("structure");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        super::take_needs();
+        let per_lane = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        assert!(
+            matches!(&per_lane, Err(crate::ShaderError::Unsupported { what, .. }) if *what == super::MASK_ELSEWHERE),
+            "expected MASK_ELSEWHERE per lane, got {:?}",
+            per_lane.err()
+        );
+        assert_eq!(
+            super::branches_around_native(&st, &super::take_needs()),
+            Some(vec![branch])
+        );
+        let c = crate::dxbc::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = crate::emit::emit(&c, &native, &p, &st, &io, &res).expect("emit with widen");
+        #[cfg(not(windows))]
+        let _ = &shader;
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            for (cutoff, expected) in [
+                (0u32, 0u32),
+                (1, u32::MAX ^ 1),
+                (13, u32::MAX ^ ((1 << 13) - 1)),
+                (32, 0),
+            ] {
+                let Some(got) = dispatch_wave32(&shader, &[cutoff]) else {
+                    return;
+                };
+                assert_eq!(got, expected, "cutoff {cutoff}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_wave32_all_lane_blocks_excludes_per_lane_loop_latch() {
+        let native = wave32_test_program(&[
+            0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBE86_076A, // loop (B1): s_not_b32 s6, vcc_lo
+            0xBF89_FFFE, // s_cbranch_execnz loop
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+        ]);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let loop_block = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
+            .expect("loop latch");
+        assert!(matches!(
+            p.blocks[loop_block].exit,
+            ir::Exit::Branch { taken, .. } if taken == loop_block
+        ));
+        let st = structure::structure(&p).expect("structure");
+        let all_native = super::all_lane_blocks_native(&st).expect("native regions");
+        assert!(
+            !all_native[loop_block],
+            "per-lane loop latch must not appear all-lanes on native wave"
+        );
+        assert_eq!(
+            super::branches_around_native(&st, &[loop_block]),
+            Some(vec![loop_block])
+        );
     }
 }
