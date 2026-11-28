@@ -2300,19 +2300,27 @@ impl<T> Spare<T> {
     }
 }
 
+fn parse_texture_readback_idle_limit(
+    enabled: Option<&std::ffi::OsStr>,
+    mb: Option<&str>,
+) -> u64 {
+    if enabled.is_some_and(|value| value == "0") {
+        return 0;
+    }
+    mb.and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|mib| mib.checked_mul(1 << 20))
+        .unwrap_or(64 << 20)
+}
+
 /// Texture readback buffers are kept apart from the mapped upload chunks.
 /// Pool only common sizes and count buffer widths, not driver residency.
 fn texture_readback_idle_limit() -> u64 {
     static LIMIT: OnceLock<u64> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if !std::env::var_os("VICTORY_READBACK_POOL").is_some_and(|value| value == "1") {
-            return 0;
-        }
-        std::env::var("VICTORY_READBACK_POOL_MB")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .and_then(|mib| mib.checked_mul(1 << 20))
-            .unwrap_or(256 << 20)
+        parse_texture_readback_idle_limit(
+            std::env::var_os("VICTORY_READBACK_POOL").as_deref(),
+            std::env::var("VICTORY_READBACK_POOL_MB").ok().as_deref(),
+        )
     })
 }
 
@@ -2395,6 +2403,21 @@ impl<T> ReadbackPool<T> {
         stats.active_bytes += bytes;
         stats.peak_active_bytes = stats.peak_active_bytes.max(stats.active_bytes);
         ReadbackLease { pool: self, buffer: Some(buffer), bytes, idle_limit }
+    }
+
+    fn trim(&self) -> u64 {
+        let (freed, bytes) = {
+            let (idle, stats) = &mut *self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let freed = idle.trim();
+            if freed.is_empty() {
+                return 0;
+            }
+            let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+            stats.idle_bytes = idle.bytes;
+            (freed, bytes)
+        };
+        drop(freed);
+        bytes
     }
 }
 
@@ -2500,6 +2523,63 @@ mod readback_pool_tests {
         assert!(pool.take(32 << 10, 256 << 20, |_| None).is_none());
         let stats = pool.0.lock().unwrap().1;
         assert_eq!((stats.created, stats.allocation_failures, stats.idle_bytes), (1, 3, 0));
+    }
+
+    #[test]
+    fn readback_pool_defaults_on_at_64_mib_and_respects_overrides() {
+        use std::ffi::OsStr;
+        assert_eq!(parse_texture_readback_idle_limit(None, None), 64 << 20);
+        assert_eq!(parse_texture_readback_idle_limit(Some(OsStr::new("0")), None), 0);
+        assert_eq!(
+            parse_texture_readback_idle_limit(Some(OsStr::new("1")), Some("128")),
+            128 << 20
+        );
+        assert_eq!(parse_texture_readback_idle_limit(None, Some("32")), 32 << 20);
+        assert_eq!(
+            parse_texture_readback_idle_limit(Some(OsStr::new("0")), Some("128")),
+            0
+        );
+    }
+
+    #[test]
+    fn readback_pool_trim_releases_idle_buffers_without_disturbing_active_leases() {
+        const CLASS: u64 = 64 << 10;
+        let pool = ReadbackPool::new();
+        let mut next = 0;
+        let a = pool
+            .take(32 << 10, 2 * CLASS, |bytes| {
+                assert_eq!(bytes, CLASS);
+                next += 1;
+                Some(next)
+            })
+            .unwrap();
+        let b = pool
+            .take(32 << 10, 2 * CLASS, |bytes| {
+                assert_eq!(bytes, CLASS);
+                next += 1;
+                Some(next)
+            })
+            .unwrap();
+        drop(a);
+        // First trim establishes the low watermark without evicting actively used pools.
+        assert_eq!(pool.trim(), 0);
+        // Second trim with no reuse across the window frees the unused idle buffer.
+        assert_eq!(pool.trim(), CLASS);
+        assert_eq!(*b.resource(), 2);
+        let stats = b.stats();
+        assert_eq!((stats.idle_bytes, stats.active_buffers, stats.active_bytes), (0, 1, CLASS));
+
+        // Cycling a buffer through take/drop resets the low watermark so the next trim keeps it.
+        drop(b);
+        assert_eq!(pool.trim(), 0);
+        let c = pool
+            .take(32 << 10, 2 * CLASS, |_| unreachable!("active pool should hit cache"))
+            .unwrap();
+        assert_eq!(*c.resource(), 2);
+        drop(c);
+        assert_eq!(pool.trim(), 0);
+        let stats = pool.0.lock().unwrap().1;
+        assert_eq!((stats.idle_bytes, stats.active_buffers, stats.active_bytes), (CLASS, 0, 0));
     }
 
     #[test]
@@ -2683,8 +2763,11 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// since the start.
 pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// Drops spare scratch chunks and idle texture readback buffers when host memory is pressured.
 fn trim_spare_chunks() {
+    if let Some(h) = host_made() {
+        h.texture_readbacks.trim();
+    }
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
@@ -9786,8 +9869,8 @@ impl Host {
 
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
-    /// with optional pooling (`VICTORY_READBACK_POOL=1`, capped at
-    /// `VICTORY_READBACK_POOL_MB`, default `256` MiB).
+    /// pooled by default (`VICTORY_READBACK_POOL=0` disables it; capped at
+    /// `VICTORY_READBACK_POOL_MB`, default `64` MiB).
     pub(crate) fn texture_readback_buffer(&'static self, size: u64) -> Option<TextureReadback> {
         self.texture_readbacks.take(size, texture_readback_idle_limit(), |bytes| {
             self.read_back_buffer(bytes)
