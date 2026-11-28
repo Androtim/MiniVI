@@ -21,6 +21,7 @@ param(
     [switch]$RayTracing,
     [switch]$Amd,
     [switch]$SkipBink,
+    [ValidateRange(0, 128)][int]$KeepRamGb = 0,
     [string]$Adapter,
     [hashtable]$More = @{}
 )
@@ -287,6 +288,7 @@ if ($Amd) {
 }
 
 if ($SkipBink) { $settings.VICTORY_SKIP_BINK = '1' }
+if ($KeepRamGb -gt 0) { $settings.VICTORY_KEEP_RAM_GB = [string]$KeepRamGb }
 if ($LazyCompare) {
     $settings.VICTORY_LAZY_COMPARE_MB = '64'
     $settings.VICTORY_LAZY_NARROW     = '1'
@@ -334,7 +336,7 @@ if (-not $NoSmoothMotion -and $fgTimes -eq 0) {
     $victory = $sm
 }
 
-$keep = 'VICTORY_HOME', 'VICTORY_ADAPTER', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
+$keep = 'VICTORY_HOME', 'VICTORY_ADAPTER', 'VICTORY_KEEP_RAM_GB', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $keep } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 

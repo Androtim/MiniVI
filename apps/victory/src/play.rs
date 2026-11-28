@@ -124,6 +124,7 @@ const SETTINGS: &[(&str, &str)] = &[
 const KEPT: &[&str] = &[
     "VICTORY_HOME",
     "VICTORY_ADAPTER",
+    "VICTORY_KEEP_RAM_GB",
     "VICTORY_CONFIG",
     "VICTORY_GAME_DIR",
     "VICTORY_CACHE_DIR",
@@ -1104,7 +1105,7 @@ mod tests {
     /// Settings read again after `prepare` clears the others survive it.
     #[test]
     fn paths_and_the_named_card_are_kept() {
-        for k in ["VICTORY_HOME", "VICTORY_ADAPTER", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
+        for k in ["VICTORY_HOME", "VICTORY_ADAPTER", "VICTORY_KEEP_RAM_GB", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
             assert!(KEPT.contains(&k), "{k}");
         }
     }
