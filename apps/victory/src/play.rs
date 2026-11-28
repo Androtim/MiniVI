@@ -108,6 +108,11 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),
+    // Memory stack (skornuta): texture slots left unused are given back under pressure,
+    // old command allocators are taken anew, and small indirect budgets share card memory
+    ("VICTORY_SLOT_EVICT", "1"),
+    ("VICTORY_ALLOCATOR_TRIM", "1"),
+    ("VICTORY_BUDGET_PACK", "1"),
 ];
 
 /// Path settings a start keeps from its surroundings; every other
@@ -1023,5 +1028,23 @@ mod tests {
         assert_eq!(stamp(0), "19700101-000000");
         assert_eq!(stamp(1_795_753_200), "20261127-042000");
         assert_eq!(stamp(951_782_400), "20000229-000000");
+    }
+
+    #[test]
+    fn memory_stack_defaults_on_and_overridable() {
+        let (s, _) = settings(&options(), &[], Some(Path::new("x")));
+        for k in ["VICTORY_SLOT_EVICT", "VICTORY_ALLOCATOR_TRIM", "VICTORY_BUDGET_PACK"] {
+            assert_eq!(s.get(k).map(String::as_str), Some("1"), "{k}");
+        }
+        let mut o = options();
+        o.more = vec![
+            "VICTORY_SLOT_EVICT=0".to_owned(),
+            "VICTORY_ALLOCATOR_TRIM=0".to_owned(),
+            "VICTORY_BUDGET_PACK=0".to_owned(),
+        ];
+        let (overridden, _) = settings(&o, &[], Some(Path::new("x")));
+        for k in ["VICTORY_SLOT_EVICT", "VICTORY_ALLOCATOR_TRIM", "VICTORY_BUDGET_PACK"] {
+            assert_eq!(overridden.get(k).map(String::as_str), Some("0"), "{k}");
+        }
     }
 }
