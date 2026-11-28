@@ -4776,13 +4776,14 @@ fn buffer_uav(
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
+/// resource's permission, of typed depth, of formats it cannot store to as a
+/// typed unordered access view, and in another format than a typed resource's.
+/// A view of a typed texture in another format of its family takes the
+/// texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+fn fits(texture: &ID3D12Resource, format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+    use crate::resource::DEPTH_FORMATS;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
@@ -4803,43 +4804,130 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
+    let Some(rewritten) = fits_format(
+        own,
+        format.as_ref().map(|f| f.0 as u32),
+        unordered,
+        crate::resource::target_format,
+        typed_store,
+    ) else {
+        return false;
+    };
+    if let (Some(format), Some(new_fmt)) = (format, rewritten) {
+        format.0 = new_fmt as i32;
+    }
+    true
+}
+
+/// Validates and potentially rewrites the requested view `format` against a
+/// host resource's own format `own`, returning `Some(rewritten)` when allowed
+/// or `None` when the host would reject or lose the device on creation.
+fn fits_format(
+    own: u32,
+    requested: Option<u32>,
+    unordered: bool,
+    stand_in: impl FnOnce(u32) -> u32,
+    can_store: impl FnOnce(u32) -> bool,
+) -> Option<Option<u32>> {
+    use crate::resource::{DEPTH_FORMATS, family};
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
-    if let Some(format) = format.as_deref_mut()
+    let is_typeless = |f: u32| family(f) == f && family(f + 1) == f;
+    let typeless = is_typeless(own);
+    let mut rewritten = None;
+    let mut view = requested.unwrap_or(0);
+    if requested.is_some()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
             .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
+            .find(|&&(s, _)| s == view)
     {
-        format.0 = linear as i32;
+        view = linear;
+        rewritten = Some(linear);
     }
-    let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if typeless {
+            return None;
+        }
+        // A typed unordered view in a format the host cannot store to
+        // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, even in the
+        // texture's own format.
+        if unordered && !can_store(own) {
+            once!(
+                view = own,
+                own,
+                "an unordered view in a format the host cannot store"
+            );
+            return None;
+        }
+        return Some(rewritten);
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
-    if view != own && crate::resource::target_format(view) == own {
-        if let Some(format) = format {
-            *format = d.Format;
+    if view != own && stand_in(view) == own {
+        if unordered && !can_store(own) {
+            once!(
+                view = own,
+                own,
+                "an unordered view in a format the host cannot store"
+            );
+            return None;
         }
-        return true;
+        return Some(Some(own));
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
-        return false;
+        return None;
     }
-    if let Some(format) = format
-        && !typeless
-    {
+    let effective = if typeless { view } else { own };
+    if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == effective) || is_typeless(effective) {
+        once!(unordered, view, own, "view the host does not allow");
+        return None;
+    }
+    if unordered && !can_store(effective) {
+        once!(
+            view = effective,
+            own,
+            "an unordered view in a format the host cannot store"
+        );
+        return None;
+    }
+    if !typeless {
         crate::resource::note_cast(
             if unordered { "unordered access" } else { "shader resource" },
             own,
             view,
         );
-        *format = d.Format;
+        rewritten = Some(own);
     }
-    true
+    Some(rewritten)
+}
+
+/// Whether the host stores to typed unordered views of `format`.
+fn typed_store(format: u32) -> bool {
+    let Some(h) = host() else {
+        return false;
+    };
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a struct of its size.
+    let ok = unsafe {
+        h.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
+    known.push((format, ok));
+    ok
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -6934,6 +7022,41 @@ mod tests {
         assert_eq!(read_stride(s0 + 3), 0);
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
+    }
+
+    #[test]
+    fn typed_uav_rejects_unsupported_formats_and_respects_effective_format() {
+        let can_store = |fmt: u32| !matches!(fmt, 30 | 86);
+        let stand_in = |fmt: u32| if fmt == 86 { 28 } else { fmt };
+
+        // Default-format (None / Some(0)) UAV of unsupported B5G5R5A1_UNORM (86) is rejected,
+        // while SRV is still allowed.
+        assert_eq!(fits_format(86, None, true, stand_in, can_store), None);
+        assert_eq!(fits_format(86, Some(0), true, stand_in, can_store), None);
+        assert_eq!(fits_format(86, None, false, stand_in, can_store), Some(None));
+        assert_eq!(fits_format(86, Some(0), false, stand_in, can_store), Some(None));
+
+        // Explicit UAV of 86 is rejected; explicit UAV of supported 28 (R8G8B8A8_UNORM) passes.
+        assert_eq!(fits_format(86, Some(86), true, stand_in, can_store), None);
+        assert_eq!(fits_format(28, Some(28), true, stand_in, can_store), Some(Some(28)));
+
+        // Typed texture (own = 28, supported) with same-family requested view (view = 30,
+        // unsupported) checks the effective format `own = 28` and rewrites to Some(28).
+        assert_eq!(fits_format(28, Some(30), true, stand_in, can_store), Some(Some(28)));
+
+        // Typed texture (own = 28) with sRGB UAV request (view = 29) maps to linear 28.
+        assert_eq!(fits_format(28, Some(29), true, stand_in, can_store), Some(Some(28)));
+
+        // Typeless texture (own = 27) checks requested format: accepts 28, rejects unsupported 30
+        // and typeless 27; R32_TYPELESS (39) rejects typed-depth D32_FLOAT (40).
+        assert_eq!(fits_format(27, Some(28), true, stand_in, can_store), Some(None));
+        assert_eq!(fits_format(27, Some(30), true, stand_in, can_store), None);
+        assert_eq!(fits_format(27, Some(27), true, stand_in, can_store), None);
+        assert_eq!(fits_format(39, Some(40), true, stand_in, can_store), None);
+
+        // Stand-in target (own = 28, view = 86, stand_in(86) == 28) checks can_store(28).
+        assert_eq!(fits_format(28, Some(86), true, stand_in, can_store), Some(Some(28)));
+        assert_eq!(fits_format(28, Some(86), true, stand_in, |_| false), None);
     }
 }
 
