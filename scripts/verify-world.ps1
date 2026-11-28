@@ -145,12 +145,11 @@ foreach ($k in $ExtraEnv.Keys) {
     $envVars[$k] = $ExtraEnv[$k]
 }
 
+$keysFile = Join-Path $OutDir 'keys.txt'
+Remove-Item $keysFile -Force -ErrorAction SilentlyContinue
 if ($AutoNudgeMenu) {
-    Add-Type -Namespace VictoryVerify -Name NativeWin -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool SetForegroundWindow(System.IntPtr hWnd);
-'@ -ErrorAction SilentlyContinue | Out-Null
-    $wshell = New-Object -ComObject WScript.Shell
+    Set-Content -Path $keysFile -Value '' -NoNewline
+    $envVars.VICTORY_KEYS_FILE = $keysFile
 }
 
 $keep = @('VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR')
@@ -200,16 +199,11 @@ try {
                 if ($hit) {
                     $worldStartedAt = [Diagnostics.Stopwatch]::StartNew()
                     Write-Host "Reached 3D world (>= 500 draws/frame) at $([int]$sw.Elapsed.TotalSeconds)s; sampling ${WorldSeconds}s..."
-                } elseif ($AutoNudgeMenu -and $sw.Elapsed.TotalSeconds -ge 30 -and $nudges -lt 5 -and ([DateTime]::UtcNow - $lastNudge).TotalSeconds -ge 10) {
-                    $proc.Refresh()
-                    if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
-                        [VictoryVerify.NativeWin]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
-                        Start-Sleep -Milliseconds 150
-                        $wshell.SendKeys('{ENTER}')
-                        $nudges++
-                        $lastNudge = [DateTime]::UtcNow
-                        Write-Host "Sent menu nudge #$nudges"
-                    }
+                } elseif ($AutoNudgeMenu -and $sw.Elapsed.TotalSeconds -ge 8 -and $nudges -lt 15 -and ([DateTime]::UtcNow - $lastNudge).TotalSeconds -ge 6) {
+                    [System.IO.File]::AppendAllText($keysFile, "Enter 0.3`n")
+                    $nudges++
+                    $lastNudge = [DateTime]::UtcNow
+                    Write-Host "Sent menu nudge #$nudges (VICTORY_KEYS_FILE: Enter 0.3)"
                 }
             }
         }

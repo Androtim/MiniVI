@@ -541,7 +541,7 @@ def analyze_run(
     }
 
     frame_metrics: list[dict[str, Any]] = []
-    if frames_dir is not None and frames_dir.is_dir():
+    if frames_dir is not None and frames_dir.is_dir() and (world_windows or first_world_frame is not None):
         candidates: list[tuple[int, Path]] = []
         for entry in frames_dir.iterdir():
             if not entry.is_file():
@@ -554,6 +554,12 @@ def analyze_run(
                 continue
             candidates.append((num, entry))
         candidates.sort(key=lambda item: item[0])
+        if len(candidates) > 24:
+            picks = sorted(
+                {0, len(candidates) - 1}
+                | {round(i * (len(candidates) - 1) / 23) for i in range(24)}
+            )
+            candidates = [candidates[i] for i in picks]
         for num, path in candidates:
             info = analyze_png(path)
             info["frame"] = num

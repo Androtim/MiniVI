@@ -152,6 +152,25 @@ class AnalyzeWorldRunTests(unittest.TestCase):
             self.assertIn("A/B VRAM non-regression", failed)
             self.assertIn("A/B Lighting/detail non-regression", failed)
 
+    def test_skips_preworld_pngs_when_world_never_reached(self) -> None:
+        preworld_only = (
+            "2026-11-28T03:00:01.000000Z INFO victory_gpu::host: 140.0 fps, 7.1 ms/frame "
+            "(0.1 preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 0.0 on the GPU; "
+            "0.0 copying back 0.0 MB), 1 draws/frame, dropped 0 without a host pipeline "
+            "(0 being made) and 0 indirect (0 of all these); textures picked by index: "
+            "64 uploaded so far (5 MB), 59 waiting, 0 passed over unmapped\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            log = root / "err.log"
+            frames = root / "frames"
+            frames.mkdir()
+            log.write_text(preworld_only, encoding="utf-8")
+            make_textured_world_png(frames / "frame-16.png")
+            summary = MOD.analyze_run(log, frames_dir=frames)
+            self.assertFalse(summary["ok"])
+            self.assertEqual(summary["visuals"]["world_png_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
