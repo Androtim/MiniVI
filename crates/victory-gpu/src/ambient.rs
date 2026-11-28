@@ -191,6 +191,88 @@ fn air() -> f32 {
     })
 }
 
+/// How the slow mean of the light around follows the frames
+/// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
+/// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is
+/// 25 frames: 0.8 s at 30 fps, 2-4 s at 7-13 fps). Set, it settles by wall
+/// time regardless of frame rate, and a brightness jump past `jump` snaps at
+/// once. Adapted from VIctory-7900XTX (`b4ba4bb` / `9576c45`, GPL-3.0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settle {
+    ms: f32,
+    jump: f32,
+    fresh: f32,
+}
+
+fn parse_settle(set: &str) -> Option<Settle> {
+    let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
+    let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+    let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+    let fresh = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    Some(Settle { ms, jump, fresh })
+}
+
+fn settle() -> Option<Settle> {
+    static SET: OnceLock<Option<Settle>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let raw = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
+        let parsed = parse_settle(&raw)?;
+        tracing::info!(
+            ms = parsed.ms,
+            jump = parsed.jump,
+            fresh = parsed.fresh,
+            "the stand-in's mean of the light around settles by the clock (VICTORY_AMBIENT_SETTLE)"
+        );
+        Some(parsed)
+    })
+}
+
+fn follow_for(dt_ms: f32, settle: Option<Settle>) -> f32 {
+    match settle {
+        Some(s) => 1.0 - (-dt_ms / s.ms).exp(),
+        None => 0.04,
+    }
+}
+
+/// The share of the way the slow mean goes at this frame's keeping
+/// ([`Role::Radiance`]; the other passes do not read it).
+fn follow(role: Role) -> f32 {
+    match settle() {
+        Some(s) => follow_for(frame_ms(role), Some(s)),
+        None => 0.04,
+    }
+}
+
+/// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
+/// the first, and after a pause of over a second, as a frame of 30. Other
+/// roles: the last answer.
+fn frame_ms(role: Role) -> f32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static DT: AtomicU32 = AtomicU32::new(0x4204_0000); // 33.0
+    if role != Role::Radiance {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    let now = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    if ASKED.swap(now, Relaxed) == now {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    let last = LAST.swap(now, Relaxed);
+    let dt = if last == u64::MAX {
+        33.0
+    } else {
+        match now.saturating_sub(last) {
+            0 => 1.0,
+            dt if dt > 1000 => 33.0,
+            dt => dt as f32,
+        }
+    };
+    DT.store(dt.to_bits(), Relaxed);
+    dt
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -207,7 +289,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -217,6 +299,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float once;
+    float jump; float fresh; float dt;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -263,7 +346,14 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // (`jump` > 0: a change of more than that factor either way is
+    // followed at once, as a new room is.)
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    // Its fourth part: seconds since the light around last jumped (from
+    // 0.001; 0: nothing kept yet).
+    float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
 }
 #endif
 
@@ -472,7 +562,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
+    // For `fresh` seconds after the light around jumped (a new room) the
+    // title's leftover counts for no more than the estimate, then up to
+    // `most` times it again: its history holds the place before.
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     float3 now = max(was, found);
@@ -715,16 +809,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 15];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.depth_size[0];
     words[7] = views.depth_size[1];
-    words[8] = 0.04f32.to_bits();
+    words[8] = follow(role).to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
+    words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
+    words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
+    words[14] = (frame_ms(role) / 1000.0).to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -732,7 +829,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -848,6 +945,48 @@ mod tests {
         }
         // Where the title's light is above the estimate nothing changes.
         assert_eq!(settle(0.8, 0.6, &[1.0, 1.0], true), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn settle_settings() {
+        assert_eq!(parse_settle("0"), None);
+        assert_eq!(parse_settle("-10"), None);
+        assert_eq!(parse_settle("nan"), None);
+        assert_eq!(
+            parse_settle("250,3"),
+            Some(Settle {
+                ms: 250.0,
+                jump: 3.0,
+                fresh: 0.0,
+            })
+        );
+        assert_eq!(
+            parse_settle("400, 2.5, 1.5"),
+            Some(Settle {
+                ms: 400.0,
+                jump: 2.5,
+                fresh: 1.5,
+            })
+        );
+    }
+
+    #[test]
+    fn follow_is_frame_rate_independent() {
+        let s = Some(Settle {
+            ms: 250.0,
+            jump: 3.0,
+            fresh: 0.0,
+        });
+        assert!((follow_for(33.3, None) - 0.04).abs() < 1e-6);
+        let expected = (-1000.0f32 / 250.0).exp();
+        for (frames, dt_ms) in [(10, 100.0), (30, 1000.0 / 30.0), (60, 1000.0 / 60.0)] {
+            let f = follow_for(dt_ms, s);
+            let remaining = (1.0 - f).powi(frames);
+            assert!(
+                (remaining - expected).abs() < 1e-5,
+                "{frames} fps: remaining {remaining} != {expected}"
+            );
+        }
     }
 
     /// The passes compile with the system's compiler and the host takes them.
