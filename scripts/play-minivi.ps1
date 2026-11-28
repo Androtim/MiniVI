@@ -12,6 +12,8 @@ param(
     [ValidateRange(1, 1000)][int]$Fps = 1000,
     [switch]$LowVram,
     [switch]$HighVram,
+    [switch]$LazyCompare,
+    [switch]$WindowGrow,
     [switch]$Preload,
     [switch]$NoSmoothMotion,
     [switch]$RayTracing,
@@ -195,7 +197,10 @@ if ($isLowVram) {
 # CPU-scaled worker thread pools and placed-order scheduling
 $cpus = [Environment]::ProcessorCount
 if ($env:MINIVI_NO_TUNE -ne '1') {
-    $settings.VICTORY_PLACED_ORDER = '1'
+    $settings.VICTORY_PLACED_ORDER    = '1'
+    $settings.VICTORY_TEXSPK_PASS_MS  = '8'
+    $settings.VICTORY_PASSES_HOT      = '1'
+    $settings.VICTORY_HELPER_PRIORITY = '1'
     if ($cpus -ge 24) {
         $settings.VICTORY_THIN_THREADS  = '12'
         $settings.VICTORY_UNDER_THREADS = '8'
@@ -278,6 +283,11 @@ if ($Amd) {
 }
 
 if ($SkipBink) { $settings.VICTORY_SKIP_BINK = '1' }
+if ($LazyCompare) {
+    $settings.VICTORY_LAZY_COMPARE_MB = '64'
+    $settings.VICTORY_LAZY_NARROW     = '1'
+}
+if ($WindowGrow) { $settings.VICTORY_WINDOW_GROW = '1' }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 
 # Apply any custom F1 menu switches saved in victory-settings.txt.
